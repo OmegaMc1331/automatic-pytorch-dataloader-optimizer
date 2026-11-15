@@ -1,0 +1,81 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "apdo"
+dynamic = ["version"]
+description = "Benchmark-driven optimizer for PyTorch DataLoader settings"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "OmegaMc1331" }]
+keywords = ["pytorch", "dataloader", "benchmark", "performance", "machine-learning"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+dependencies = ["torch>=2.10"]
+
+[project.optional-dependencies]
+dev = [
+    "build>=1.2",
+    "pytest>=8",
+    "ruff>=0.9",
+    "twine>=5",
+]
+
+[project.urls]
+Homepage = "https://github.com/OmegaMc1331/automatic-pytorch-dataloader-optimizer"
+Repository = "https://github.com/OmegaMc1331/automatic-pytorch-dataloader-optimizer"
+Issues = "https://github.com/OmegaMc1331/automatic-pytorch-dataloader-optimizer/issues"
+Changelog = "https://github.com/OmegaMc1331/automatic-pytorch-dataloader-optimizer/blob/main/CHANGELOG.md"
+
+[project.scripts]
+apdo = "apdo.cli:main"
+
+[tool.hatch.version]
+path = "src/apdo/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/apdo"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src/apdo",
+    "/tests",
+    "/examples",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+    "/pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "cuda: tests that require a CUDA device",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
