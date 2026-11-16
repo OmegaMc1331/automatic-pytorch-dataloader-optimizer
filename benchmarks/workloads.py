@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from array import array
 from pathlib import Path
 
 import torch
@@ -87,7 +88,7 @@ def materialize_disk_data(
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("wb") as handle:
         for index in range(size):
-            handle.write(features[index].numpy().tobytes())
+            handle.write(array("f", features[index].tolist()).tobytes())
             handle.write(int(labels[index]).to_bytes(8, "little", signed=True))
     temporary.replace(path)
     return path
