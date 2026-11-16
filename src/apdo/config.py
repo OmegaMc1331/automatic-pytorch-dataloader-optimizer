@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from apdo.errors import ConfigurationError
+
+BENCHMARK_PROTOCOL_VERSION = "2.0"
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,7 +77,7 @@ class LoaderConfig:
 
 @dataclass(frozen=True, slots=True)
 class BenchmarkSettings:
-    batch_size: int
+    batch_size: int | None
     requested_device: str
     device: str
     warmup_runs: int
@@ -85,6 +87,16 @@ class BenchmarkSettings:
     max_ram_gb: float | None
     dataset_size: int
     cpu_count: int
+    seed: int = 42
+    rounds: int = 3
+    validation_rounds: int = 5
+    min_improvement: float = 0.05
+    validation_enabled: bool = True
+    time_budget_s: float | None = None
+    initial_config: LoaderConfig = field(default_factory=LoaderConfig)
+    input_kind: str = "dataset"
+    protocol_version: str = "2.0"
+    expected_batches: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -98,4 +110,14 @@ class BenchmarkSettings:
             "max_ram_gb": self.max_ram_gb,
             "dataset_size": self.dataset_size,
             "cpu_count": self.cpu_count,
+            "seed": self.seed,
+            "rounds": self.rounds,
+            "validation_rounds": self.validation_rounds,
+            "min_improvement": self.min_improvement,
+            "validation_enabled": self.validation_enabled,
+            "time_budget_s": self.time_budget_s,
+            "initial_config": self.initial_config.to_dict(),
+            "input_kind": self.input_kind,
+            "protocol_version": self.protocol_version,
+            "expected_batches": self.expected_batches,
         }

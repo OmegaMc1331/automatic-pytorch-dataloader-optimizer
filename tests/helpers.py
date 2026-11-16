@@ -8,6 +8,19 @@ from apdo.config import BenchmarkSettings, LoaderConfig
 from apdo.metrics import PassMetrics, summarize_passes
 from apdo.report import OptimizationResult
 from apdo.resources import EnvironmentInfo, MemorySnapshot
+from apdo.validation import ValidationObservation, ValidationResult, analyze_validation
+
+
+def make_pass_metrics(throughput: float, *, batches: int = 3) -> PassMetrics:
+    return PassMetrics(
+        startup_s=0.02,
+        steady_elapsed_s=1.0,
+        batches=batches,
+        steady_samples=throughput,
+        throughput=throughput,
+        latencies_s=(0.01, 0.02),
+        gpu_transfer_active=False,
+    )
 
 
 def make_measurement(
@@ -89,18 +102,59 @@ def make_environment() -> EnvironmentInfo:
     )
 
 
-def make_settings() -> BenchmarkSettings:
+def make_settings(
+    *,
+    initial_config: LoaderConfig | None = None,
+) -> BenchmarkSettings:
     return BenchmarkSettings(
         batch_size=8,
         requested_device="cpu",
         device="cpu",
         warmup_runs=1,
         repetitions=3,
+        rounds=3,
         max_batches=10,
         max_workers=4,
         max_ram_gb=2.0,
         dataset_size=64,
         cpu_count=8,
+        seed=42,
+        validation_rounds=5,
+        min_improvement=0.05,
+        validation_enabled=True,
+        time_budget_s=None,
+        initial_config=initial_config or LoaderConfig(),
+        input_kind="dataset",
+        protocol_version="2.0",
+        expected_batches=8,
+    )
+
+
+def make_validation(
+    baseline: LoaderConfig | None = None,
+    candidate: LoaderConfig | None = None,
+    gains: tuple[float, ...] = (0.25, 0.25, 0.25),
+    *,
+    enabled: bool = True,
+    min_improvement: float = 0.05,
+) -> ValidationResult:
+    baseline = baseline or LoaderConfig()
+    candidate = candidate or LoaderConfig(num_workers=1, prefetch_factor=2)
+    observations = tuple(
+        ValidationObservation(
+            round_index=index,
+            baseline=make_pass_metrics(100.0),
+            candidate=make_pass_metrics(100.0 * (1.0 + gain)),
+        )
+        for index, gain in enumerate(gains)
+    )
+    return analyze_validation(
+        baseline,
+        candidate,
+        observations,
+        enabled=enabled,
+        min_improvement=min_improvement,
+        seed=13,
     )
 
 
@@ -110,17 +164,24 @@ def make_result(
     fastest_config: LoaderConfig,
     *,
     warnings: tuple[str, ...] = (),
+    validation: ValidationResult | None = None,
+    settings: BenchmarkSettings | None = None,
 ) -> OptimizationResult:
+    validation = validation or make_validation(candidate=best_config)
     return OptimizationResult(
         best_config=best_config,
         fastest_config=fastest_config,
         measurements=measurements,
         environment=make_environment(),
-        settings=make_settings(),
+        settings=settings or make_settings(initial_config=validation.baseline_config),
         warnings=warnings,
         selection_reason="Test selection reason.",
         baseline_throughput=80.0,
-        improvement_percent=25.0,
+        improvement_percent=(validation.improvement_percent if validation.confirmed else 0.0),
         started_at=datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
         duration_s=1.25,
+        validation=validation,
+        search_selected_config=validation.candidate_config,
+        search_improvement_percent=validation.improvement_percent,
+        search_selection_reason="Test search selection reason.",
     )

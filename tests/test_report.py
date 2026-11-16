@@ -39,6 +39,8 @@ def test_summary_is_human_readable(result) -> None:
     assert "100.0 samples/s" in text
     assert "fastest measured configuration" in text
     assert "Test selection reason." in text
+    assert "Recommendation validation" in text
+    assert "status: confirmed" in text
     assert "Dataset warning <unsafe>" in text
     assert result.best_summary.median_throughput == 100.0
 
@@ -49,11 +51,17 @@ def test_json_export(result, tmp_path: Path) -> None:
     result.to_json(target)
 
     payload = json.loads(target.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 1
-    assert payload["apdo_version"] == "0.1.0"
+    assert payload["schema_version"] == 2
+    assert payload["apdo_version"] == "0.2.0"
+    assert payload["protocol"]["seed"] == 42
+    assert payload["protocol"]["search_rounds"] == 3
     assert payload["recommended"]["config"]["num_workers"] == 1
+    assert payload["recommended"]["validation_status"] == "confirmed"
     assert payload["fastest"]["config"]["num_workers"] == 2
     assert payload["settings"]["batch_size"] == 8
+    assert payload["validation"]["status"] == "confirmed"
+    assert payload["validation"]["candidate_config"]["num_workers"] == 1
+    assert len(payload["validation"]["observations"]) == 3
     assert payload["failures"][0]["error_message"] == "<script>worker failed</script>"
     assert payload["warnings"] == ["Dataset warning <unsafe>"]
     assert len(payload["configurations"]) == 4
@@ -72,6 +80,8 @@ def test_html_export_is_standalone_and_escaped(result, tmp_path: Path) -> None:
     assert html.startswith("<!DOCTYPE html>")
     assert "PyTorch DataLoader benchmark report" in html
     assert "Recommended configuration" in html
+    assert "Recommendation Validation" in html
+    assert "confirmed" in html
     assert "num_workers=1" in html
     assert "Limitations" in html
     assert "&lt;script&gt;worker failed&lt;/script&gt;" in html

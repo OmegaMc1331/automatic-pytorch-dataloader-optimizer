@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 import torch
 from torch.utils.data import Dataset, IterableDataset
 
 from apdo.benchmark import (
     benchmark_config,
+    benchmark_rounds,
     dataset_length,
     plan_batches,
+    plan_from_template,
 )
 from apdo.config import LoaderConfig
 from apdo.errors import ConfigurationError, DatasetError
+from apdo.loader import LoaderTemplate
 from tests.datasets import RaisingDataset, SyntheticDataset
 
 
@@ -123,4 +128,106 @@ def test_keyboard_interrupt_propagates() -> None:
             warmup_runs=1,
             repetitions=2,
             max_ram_bytes=None,
+        )
+
+
+class WorkerSensitiveDataset(Dataset):
+    def __init__(self, size: int = 16) -> None:
+        self.size = size
+        self.parent_pid = os.getpid()
+
+    def __len__(self) -> int:
+        return self.size
+
+    def __getitem__(self, index: int) -> torch.Tensor:
+        if os.getpid() != self.parent_pid:
+            raise RuntimeError("worker process failure")
+        return torch.full((4,), float(index))
+
+
+def test_benchmark_rounds_records_balanced_rounds_and_actual_samples() -> None:
+    dataset = SyntheticDataset(size=16, feature_dim=4)
+    template = LoaderTemplate.from_dataset(dataset, 4)
+    plan = plan_from_template(template, 3)
+    configs = (LoaderConfig(), LoaderConfig(1))
+    messages: list[str] = []
+
+    stage = benchmark_rounds(
+        template,
+        configs,
+        phase="test",
+        device=torch.device("cpu"),
+        plan=plan,
+        warmup_rounds=1,
+        rounds=2,
+        max_ram_bytes=None,
+        seed=5,
+        progress=messages.append,
+    )
+
+    assert stage.measurements and all(item.succeeded for item in stage.measurements)
+    for measurement in stage.measurements:
+        assert len(measurement.rounds) == 2
+        assert len(measurement.passes) == 2
+        assert [item.round_index for item in measurement.rounds] == [0, 1]
+        assert all(item.pass_metrics.steady_samples == 8 for item in measurement.rounds)
+        assert all(item.pass_metrics.batches == 3 for item in measurement.rounds)
+
+    measured = [order for order in stage.orders if order.measured]
+    warmup = [order for order in stage.orders if not order.measured]
+    assert len(measured) == 2
+    assert len(warmup) == 1
+    assert all(set(order.configs) == set(configs) for order in measured)
+    for position in range(2):
+        assert {order.configs[position] for order in measured} == set(configs)
+    assert any("round 1/2" in message for message in messages)
+    assert any("warmup 1/1" in message for message in messages)
+
+
+def test_benchmark_rounds_isolates_worker_failure() -> None:
+    dataset = WorkerSensitiveDataset()
+    template = LoaderTemplate.from_dataset(dataset, 4)
+    plan = plan_from_template(template, 2)
+
+    stage = benchmark_rounds(
+        template,
+        (LoaderConfig(), LoaderConfig(1)),
+        phase="test",
+        device=torch.device("cpu"),
+        plan=plan,
+        warmup_rounds=1,
+        rounds=2,
+        max_ram_bytes=None,
+        seed=5,
+    )
+
+    by_workers = {item.config.num_workers: item for item in stage.measurements}
+    assert by_workers[0].succeeded
+    assert not by_workers[1].succeeded
+    assert "worker process failure" in (by_workers[1].error_message or "")
+
+
+@pytest.mark.parametrize(
+    ("rounds", "warmup_rounds", "configs"),
+    [
+        (0, 1, (LoaderConfig(),)),
+        (1, -1, (LoaderConfig(),)),
+        (1, 0, ()),
+    ],
+)
+def test_benchmark_rounds_validates_arguments(rounds, warmup_rounds, configs) -> None:
+    template = LoaderTemplate.from_dataset(SyntheticDataset(size=8), 4)
+    plan = plan_from_template(template, 2)
+
+    with pytest.raises(ConfigurationError):
+        benchmark_rounds(
+            template,
+            configs,
+            phase="test",
+            device=torch.device("cpu"),
+            plan=plan,
+            warmup_rounds=warmup_rounds,
+            rounds=rounds,
+            max_ram_bytes=None,
+            seed=1,
         )

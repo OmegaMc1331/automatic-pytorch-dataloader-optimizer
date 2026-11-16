@@ -19,10 +19,17 @@ def main() -> None:
         device="cpu",
         max_ram_gb=2,
         max_batches=50,
-        repetitions=3,
+        rounds=3,
+        validation_rounds=5,
         max_workers=4,
+        seed=42,
     )
     print(result.summary())
+    print(f"Validation status: {result.validation.status}")
+
+    optimized_loader = result.build_dataloader()
+    features_batch, _ = next(iter(optimized_loader))
+    print(f"Optimized batch shape: {tuple(features_batch.shape)}")
 
     reports = Path("reports")
     result.to_json(reports / "benchmark.json")

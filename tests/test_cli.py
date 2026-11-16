@@ -38,13 +38,18 @@ def test_benchmark_help() -> None:
     assert completed.returncode == 0
     assert "MODULE:FACTORY" in completed.stdout
     assert "--max-batches" in completed.stdout
+    assert "--seed" in completed.stdout
+    assert "--validation-rounds" in completed.stdout
+    assert "--min-improvement" in completed.stdout
+    assert "--time-budget-s" in completed.stdout
+    assert "--no-validation" in completed.stdout
 
 
 def test_version() -> None:
     completed = run_cli("--version")
 
     assert completed.returncode == 0
-    assert "apdo 0.1.0" in completed.stdout
+    assert "apdo 0.2.0" in completed.stdout
 
 
 def test_no_command_prints_help() -> None:
@@ -72,6 +77,8 @@ def test_benchmark_end_to_end(tmp_path: Path) -> None:
         "2",
         "--max-workers",
         "1",
+        "--sample-count-fn",
+        "examples.synthetic_dataset:create_sample_counter",
         "--json",
         str(json_path),
         "--html",
@@ -86,7 +93,51 @@ def test_benchmark_end_to_end(tmp_path: Path) -> None:
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     assert payload["recommended"]["config"]["num_workers"] >= 0
     assert payload["settings"]["device"] == "cpu"
+    assert payload["loader"]["sample_count_fn"] is True
     assert html_path.read_text(encoding="utf-8").startswith("<!DOCTYPE html>")
+
+
+def test_benchmark_accepts_a_dataloader_factory(tmp_path: Path) -> None:
+    json_path = tmp_path / "loader.json"
+
+    completed = run_cli(
+        "benchmark",
+        "--dataset",
+        "examples.synthetic_dataset:create_loader",
+        "--device",
+        "cpu",
+        "--max-batches",
+        "3",
+        "--repetitions",
+        "2",
+        "--validation-rounds",
+        "2",
+        "--no-validation",
+        "--max-workers",
+        "1",
+        "--json",
+        str(json_path),
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert payload["settings"]["input_kind"] == "dataloader"
+    assert payload["settings"]["batch_size"] == 16
+    assert payload["validation"]["status"] in {"not_needed", "not_possible"}
+    assert payload["recommended"]["config"]["num_workers"] == 0
+
+
+def test_invalid_numeric_options_are_rejected() -> None:
+    completed = run_cli(
+        "benchmark",
+        "--dataset",
+        "examples.synthetic_dataset:create_dataset",
+        "--validation-rounds",
+        "1",
+    )
+
+    assert completed.returncode == 2
+    assert "at least 2" in completed.stderr
 
 
 def test_missing_dataset_module_is_reported() -> None:

@@ -14,6 +14,8 @@ env/
 htmlcov/
 benchmark.json
 benchmark.html
+benchmarks/.cache/
+benchmarks/results/
 reports/
 .idea/
 .vscode/

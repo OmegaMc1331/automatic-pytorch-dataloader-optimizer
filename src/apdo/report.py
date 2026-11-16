@@ -7,29 +7,46 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from torch.utils.data import DataLoader
+
 from apdo._version import __version__
 from apdo.benchmark import ConfigMeasurement
 from apdo.config import BenchmarkSettings, LoaderConfig
+from apdo.loader import LoaderTemplate
 from apdo.metrics import MetricsSummary
+from apdo.order import RoundOrder
 from apdo.resources import EnvironmentInfo
+from apdo.validation import ValidationResult
 
 METHOD = {
+    "protocol": (
+        "Benchmark protocol 2.0. Search configurations are measured in seeded, "
+        "balanced rounds. Each configuration receives discarded warmup rounds followed "
+        "by one measured pass per round. The executed order is recorded."
+    ),
     "search": (
         "Two-stage grid search. Stage 1 scans num_workers with default prefetch "
-        "settings and both pin_memory values on CUDA. Stage 2 varies prefetch_factor "
+        "settings and applicable pin_memory values. Stage 2 varies prefetch_factor "
         "and persistent_workers for the two best multi-worker counts."
     ),
-    "selection_metric": "Median steady-state throughput across measured passes.",
+    "selection_metric": "Median steady-state throughput across balanced measured rounds.",
     "uncertainty": (
-        "95% percentile bootstrap interval of the median throughput, computed from "
-        "2000 resamples of the measured passes."
+        "95% percentile bootstrap interval of the median throughput from measured "
+        "rounds. Validation uses a paired bootstrap interval of per-round relative gains."
     ),
     "selection_rule": (
-        "The simplest configuration whose median throughput is within 5% of the "
-        "fastest configuration and whose bootstrap interval overlaps the fastest "
-        "interval is selected. Interval overlap is an equivalence heuristic, not a "
-        "formal hypothesis test. Simplicity is ordered by fewer workers, no pinning, "
-        "non-persistent workers, and lower prefetch_factor."
+        "The search favors the simplest configuration whose median throughput is within "
+        "5% of the fastest and whose bootstrap interval overlaps the fastest interval. "
+        "The search candidate then faces independent paired validation. A candidate is "
+        "recommended only if validation shows at least the configured minimum improvement "
+        "and its 95% interval is above zero; otherwise the initial configuration is kept. "
+        "Interval overlap during search is a heuristic, not a formal test."
+    ),
+    "validation": (
+        "Validation uses fresh measurements, not search results. The initial and candidate "
+        "configurations run in alternating balanced order for the configured validation "
+        "rounds. The paired relative throughput gains are summarized by their median and a "
+        "95% percentile bootstrap interval."
     ),
     "throughput_scope": (
         "Data loading plus host-to-device tensor copies when the resolved device is "
@@ -42,18 +59,26 @@ LIMITATIONS = (
     "are not training throughput.",
     "max_ram_gb is a sampled system-memory guard, not a hard limit. Allocations can "
     "occur between samples, and unrelated processes affect the observed value.",
-    "Configurations are benchmarked sequentially and not in randomized order, so "
-    "slow drift in machine load can bias later measurements.",
-    "Confidence intervals reflect variation across measured passes only. Interval "
-    "overlap is an equivalence heuristic, not a formal hypothesis test, and intervals "
-    "do not model dataset randomness or long-term system variability.",
-    "Only map-style datasets with __len__ and __getitem__ are supported in v0.1.0.",
-    "The same dataset object is reused across configurations. Dataset caching or "
-    "state changes can make later configurations appear faster.",
+    "Balanced rounds and randomized order reduce simple ordering bias but do not remove "
+    "operating-system caches, dataset caches, storage warm-up, CPU load drift, thermal "
+    "effects, or memory retained between configurations.",
+    "Warmup rounds are discarded and measured rounds are reported separately. A new "
+    "loader is constructed for each pass, which keeps pass conditions comparable but does "
+    "not model every long-lived-worker usage pattern.",
+    "APDO does not reset dataset, sampler, transform, or global RNG state. Stateful or "
+    "random pipelines can process different samples in different rounds.",
+    "Confidence intervals reflect variation across rounds only. Validation intervals are "
+    "paired percentile bootstrap intervals, not universal guarantees or formal proof.",
+    "Only map-style datasets with __len__ and __getitem__ are supported in v0.2.0.",
+    "Custom samplers, batch samplers, generators, collate functions, and worker_init_fn "
+    "objects are reused by reference. Their mutable state is shared with the original "
+    "loader and can change during benchmarking.",
     "Process RSS covers the parent process and is absolute, so it can include memory "
     "retained from earlier configurations. Worker memory is reflected only indirectly "
     "by system-wide memory availability. These memory observations are implemented "
     "for Windows and Linux.",
+    "Variable-size batches are supported through actual sample counting, but the count "
+    "must be inferable from tensor leading dimensions or supplied by sample_count_fn.",
 )
 
 
@@ -70,18 +95,29 @@ class OptimizationResult:
     improvement_percent: float | None
     started_at: datetime
     duration_s: float
+    validation: ValidationResult
+    round_orders: tuple[RoundOrder, ...] = ()
+    loader_template: LoaderTemplate | None = None
+    search_selected_config: LoaderConfig | None = None
+    search_improvement_percent: float | None = None
+    search_selection_reason: str | None = None
+    budget_exhausted: bool = False
     version: str = __version__
 
     @property
     def best_summary(self) -> MetricsSummary:
-        for measurement in self.measurements:
-            if (
-                measurement.succeeded
-                and measurement.config == self.best_config
-                and measurement.summary is not None
-            ):
-                return measurement.summary
-        raise ValueError("the recommended configuration has no completed measurement")
+        return self._measurement_for(self.best_config).summary_or_raise()
+
+    @property
+    def search_candidate_config(self) -> LoaderConfig:
+        if self.search_selected_config is not None:
+            return self.search_selected_config
+        return self.validation.candidate_config
+
+    def build_dataloader(self) -> DataLoader:
+        if self.loader_template is None:
+            raise ValueError("this result does not contain a reconstructable loader template")
+        return self.loader_template.build(self.best_config)
 
     def summary(self) -> str:
         measurement = self._measurement_for(self.best_config)
@@ -96,10 +132,24 @@ class OptimizationResult:
         )
         memory = _memory_text(summary)
         cold_start = _fmt_ms(measurement.cold_start_s)
+        validation = self.validation
+        gain_text = _fmt_percent(validation.improvement_percent)
+        interval_text = _fmt_interval(validation)
+        if validation.confirmed:
+            improvement = f"validated gain: {gain_text} ({interval_text})"
+        else:
+            improvement = "no confirmed gain; initial configuration retained"
 
         lines = [
             "Recommended DataLoader configuration",
             f"  {self.best_config.describe()}",
+            "",
+            "Recommendation validation",
+            f"  status: {validation.status}",
+            f"  initial configuration: {validation.baseline_config.describe()}",
+            f"  search candidate: {validation.candidate_config.describe()}",
+            f"  observed median change: {gain_text} ({interval_text})",
+            f"  decision: {validation.reason}",
             "",
             "Measured performance",
             f"  median throughput: {summary.median_throughput:,.1f} samples/s",
@@ -110,27 +160,32 @@ class OptimizationResult:
             f"  startup to first batch: {_fmt_ms(summary.median_startup_s)} "
             f"(cold start {cold_start})",
             f"  observed memory: {memory}",
+            f"  {improvement}",
         ]
-        if self.improvement_percent is not None:
-            lines.append(f"  improvement vs default: {self.improvement_percent:+.1f}%")
-        else:
-            lines.append("  improvement vs default: n/a")
         if self.fastest_config != self.best_config:
             lines.append(f"  fastest measured configuration: {self.fastest_config.describe()}")
+        if self.search_candidate_config != self.best_config:
+            lines.append(
+                f"  search candidate not retained: {self.search_candidate_config.describe()}"
+            )
         lines.extend(
             [
                 "",
                 "Benchmark",
-                f"  {self.settings.repetitions} measured passes, "
+                f"  {self.settings.rounds} measured search rounds, "
+                f"{self.settings.validation_rounds} validation rounds, "
                 f"{batches} batches per pass, {self.settings.dataset_size} dataset "
-                f"samples, batch_size={self.settings.batch_size}",
+                f"samples, batch_size={self._batch_size_text()}",
+                f"  seed: {self.settings.seed}; input: {self.settings.input_kind}",
                 f"  device: {device_note}",
-                f"  {len(self.measurements)} configurations measured ({failed} failed)",
+                f"  {len(self.measurements)} search configurations measured ({failed} failed)",
                 "",
                 "Selection",
                 f"  {self.selection_reason}",
             ]
         )
+        if self.search_selection_reason is not None:
+            lines.append(f"  search: {self.search_selection_reason}")
         if self.warnings:
             lines.extend(["", "Warnings"])
             lines.extend(f"  - {warning}" for warning in self.warnings)
@@ -139,16 +194,24 @@ class OptimizationResult:
     def to_dict(self) -> dict[str, Any]:
         ranked = self._ranked_successes()
         ranks = {item.config: index for index, item in enumerate(ranked, start=1)}
-        fastest = self._measurement_for(self.fastest_config)
-        fastest_summary = fastest.summary
-        if fastest_summary is None:
-            raise ValueError("the fastest configuration has no completed measurement")
+        fastest = self._search_measurement_for(self.fastest_config)
+        fastest_summary = fastest.summary_or_raise()
+        final_measurement = self._measurement_for(self.best_config)
+        final_summary = final_measurement.summary_or_raise()
+        baseline_measurement = self._search_measurement_for(
+            self.settings.initial_config,
+            required=False,
+        )
+        baseline_summary = (
+            baseline_measurement.summary if baseline_measurement is not None else None
+        )
 
         configurations = []
         for measurement in ranked:
             entry = measurement.to_dict()
             entry["rank"] = ranks[measurement.config]
             entry["recommended"] = measurement.config == self.best_config
+            entry["search_candidate"] = measurement.config == self.search_candidate_config
             configurations.append(entry)
         for measurement in self.measurements:
             if measurement.succeeded:
@@ -156,6 +219,7 @@ class OptimizationResult:
             entry = measurement.to_dict()
             entry["rank"] = None
             entry["recommended"] = False
+            entry["search_candidate"] = measurement.config == self.search_candidate_config
             configurations.append(entry)
 
         failures = [
@@ -168,19 +232,51 @@ class OptimizationResult:
             for item in self.measurements
             if not item.succeeded
         ]
+        measured_orders = [item.to_dict() for item in self.round_orders if item.measured]
+        warmup_orders = [item.to_dict() for item in self.round_orders if not item.measured]
+        baseline_payload: dict[str, Any] = {
+            "config": self.settings.initial_config.to_dict(),
+        }
+        if baseline_summary is not None:
+            baseline_payload["search_summary"] = baseline_summary.to_dict()
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "apdo_version": self.version,
             "started_at_utc": self.started_at.isoformat(),
             "duration_s": self.duration_s,
+            "protocol": {
+                "protocol_version": self.settings.protocol_version,
+                "seed": self.settings.seed,
+                "search_rounds": self.settings.rounds,
+                "validation_rounds": self.settings.validation_rounds,
+                "min_improvement": self.settings.min_improvement,
+                "validation_enabled": self.settings.validation_enabled,
+                "time_budget_s": self.settings.time_budget_s,
+                "budget_exhausted": self.budget_exhausted,
+                "measured_orders": measured_orders,
+                "warmup_orders": warmup_orders,
+            },
             "environment": self.environment.to_dict(),
             "settings": self.settings.to_dict(),
+            "loader": self._loader_details(),
             "method": dict(METHOD),
             "limitations": list(LIMITATIONS),
+            "baseline": baseline_payload,
+            "search": {
+                "recommended_config": self.search_candidate_config.to_dict(),
+                "fastest_config": self.fastest_config.to_dict(),
+                "improvement_percent": self.search_improvement_percent,
+                "selection_reason": self.search_selection_reason,
+                "median_throughput": self._search_measurement_for(self.search_candidate_config)
+                .summary_or_raise()
+                .median_throughput,
+            },
+            "validation": self.validation.to_dict(),
             "recommended": {
                 "config": self.best_config.to_dict(),
-                "median_throughput": self.best_summary.median_throughput,
+                "median_throughput": final_summary.median_throughput,
                 "improvement_percent": self.improvement_percent,
+                "validation_status": self.validation.status,
                 "selection_reason": self.selection_reason,
             },
             "fastest": {
@@ -209,6 +305,17 @@ class OptimizationResult:
         target.write_text(self._html(), encoding="utf-8")
 
     def _measurement_for(self, config: LoaderConfig) -> ConfigMeasurement:
+        measurement = self._search_measurement_for(config, required=False)
+        if measurement is None:
+            raise ValueError(f"no completed measurement for {config.describe()}")
+        return measurement
+
+    def _search_measurement_for(
+        self,
+        config: LoaderConfig,
+        *,
+        required: bool = True,
+    ) -> ConfigMeasurement | None:
         for measurement in self.measurements:
             if (
                 measurement.succeeded
@@ -216,7 +323,9 @@ class OptimizationResult:
                 and measurement.summary is not None
             ):
                 return measurement
-        raise ValueError(f"no completed measurement for {config.describe()}")
+        if required:
+            raise ValueError(f"no completed search measurement for {config.describe()}")
+        return None
 
     def _ranked_successes(self) -> list[ConfigMeasurement]:
         ranked = [item for item in self.measurements if item.succeeded and item.summary is not None]
@@ -235,7 +344,7 @@ class OptimizationResult:
         fastest_note = ""
         if self.fastest_config != self.best_config:
             fastest_note = (
-                '<p class="muted">Fastest measured configuration: '
+                '<p class="muted">Fastest measured search configuration: '
                 f"<code>{escape(self.fastest_config.describe())}</code></p>"
             )
 
@@ -253,11 +362,7 @@ class OptimizationResult:
             for label, value in metric_cards
         )
 
-        improvement = (
-            f"{self.improvement_percent:+.1f}% vs default"
-            if self.improvement_percent is not None
-            else "n/a"
-        )
+        improvement_html = self._improvement_html()
         warnings_html = ""
         if self.warnings:
             items = "\n".join(f"<li>{escape(item)}</li>" for item in self.warnings)
@@ -337,16 +442,44 @@ class OptimizationResult:
             f"<tr><th>{escape(label)}</th><td>{escape(value)}</td></tr>" for label, value in recent
         )
 
+        loader_details = self._loader_details()
         settings_rows = [
+            ("Protocol", self.settings.protocol_version),
+            ("Input", self.settings.input_kind),
+            ("Loader dataset", loader_details["dataset"] if loader_details else "n/a"),
+            ("Loader sampler", loader_details["sampler"] if loader_details else "n/a"),
+            (
+                "Loader batch sampler",
+                (loader_details["batch_sampler"] or "none") if loader_details else "n/a",
+            ),
+            ("Loader collate", loader_details["collate_fn"] if loader_details else "n/a"),
+            ("Loader drop_last", str(loader_details["drop_last"]) if loader_details else "n/a"),
+            ("Loader timeout", str(loader_details["timeout"]) if loader_details else "n/a"),
+            ("Seed", str(self.settings.seed)),
             ("Device", self.settings.device),
             ("Requested device", self.settings.requested_device),
             ("Dataset size", f"{self.settings.dataset_size:,} samples"),
-            ("Batch size", str(self.settings.batch_size)),
+            ("Batch size", self._batch_size_text()),
             ("Batches per pass", str(self.best_measurement_batches())),
-            ("Measured passes", str(self.settings.repetitions)),
-            ("Warmup passes", str(self.settings.warmup_runs)),
+            ("Search rounds", str(self.settings.rounds)),
+            ("Validation rounds", str(self.settings.validation_rounds)),
+            ("Warmup rounds", str(self.settings.warmup_runs)),
+            (
+                "Minimum improvement",
+                f"{self.settings.min_improvement * 100:.1f}%",
+            ),
             ("Worker search limit", str(self.settings.max_workers)),
-            ("max_ram_gb", str(self.settings.max_ram_gb) if self.settings.max_ram_gb else "none"),
+            (
+                "max_ram_gb",
+                str(self.settings.max_ram_gb) if self.settings.max_ram_gb else "none",
+            ),
+            (
+                "Time budget",
+                f"{self.settings.time_budget_s:.2f} s"
+                if self.settings.time_budget_s is not None
+                else "none",
+            ),
+            ("Budget exhausted", "yes" if self.budget_exhausted else "no"),
             ("Duration", f"{self.duration_s:.2f} s"),
         ]
         settings_html = "\n".join(
@@ -360,6 +493,8 @@ class OptimizationResult:
             for key, value in METHOD.items()
         )
         limitations_html = "\n".join(f"<li>{escape(item)}</li>" for item in LIMITATIONS)
+        validation_html = self._validation_html()
+        order_html = self._order_html()
 
         return f"""<!DOCTYPE html>
 <html lang="en">
@@ -383,9 +518,11 @@ completed in {self.duration_s:.2f} s</p>
 <p class="eyebrow">Recommended configuration</p>
 <h2><code>{escape(self.best_config.describe())}</code></h2>
 <div class="metrics">{cards_html}</div>
-<p><strong>{escape(improvement)}</strong>. {escape(self.selection_reason)}</p>
+{improvement_html}
 {fastest_note}
 </section>
+
+{validation_html}
 
 {warnings_html}
 
@@ -401,6 +538,8 @@ completed in {self.duration_s:.2f} s</p>
 </table>
 </div>
 </section>
+
+{order_html}
 
 {failures_html}
 
@@ -433,9 +572,157 @@ requires no network access. Throughput covers data loading, not model training.
 </html>
 """
 
+    def _improvement_html(self) -> str:
+        escape = html.escape
+        validation = self.validation
+        if validation.confirmed:
+            gain = _fmt_percent(validation.improvement_percent)
+            return (
+                f"<p><strong>Validated gain: {escape(gain)}</strong> "
+                f"({escape(_fmt_interval(validation))}). "
+                f"{escape(validation.reason)}</p>"
+            )
+        return (
+            "<p><strong>No validated gain.</strong> The initial configuration is retained. "
+            f"{escape(validation.reason)}</p>"
+        )
+
+    def _validation_html(self) -> str:
+        escape = html.escape
+        validation = self.validation
+        baseline_median = (
+            f"{validation.baseline_summary.median_throughput:,.1f} samples/s"
+            if validation.baseline_summary is not None
+            else "n/a"
+        )
+        candidate_median = (
+            f"{validation.candidate_summary.median_throughput:,.1f} samples/s"
+            if validation.candidate_summary is not None
+            else "n/a"
+        )
+        rows = []
+        for observation in validation.observations:
+            rows.append(
+                f"<tr><td>{observation.round_index + 1}</td>"
+                f"<td>{observation.baseline.throughput:,.1f}</td>"
+                f"<td>{observation.candidate.throughput:,.1f}</td>"
+                f"<td>{observation.gain * 100:+.1f}%</td></tr>"
+            )
+        observations_html = ""
+        if rows:
+            observations_html = (
+                '<div class="table-wrap"><table><thead><tr>'
+                "<th>Round</th><th>Baseline samples/s</th><th>Candidate samples/s</th>"
+                "<th>Paired gain</th></tr></thead><tbody>"
+                + "".join(rows)
+                + "</tbody></table></div>"
+            )
+        failures_html = ""
+        if validation.failures:
+            failure_items = "\n".join(f"<li>{escape(item)}</li>" for item in validation.failures)
+            failures_html = f"<h3>Validation failures</h3><ul>{failure_items}</ul>"
+
+        search_note = ""
+        if self.search_candidate_config != self.best_config:
+            search_note = (
+                '<p class="muted">The search candidate was '
+                f"<code>{escape(self.search_candidate_config.describe())}</code>. "
+                "It was not retained because independent validation did not confirm "
+                "the required gain.</p>"
+            )
+
+        return f"""<section class="card validation">
+<p class="eyebrow">Recommendation Validation</p>
+<p><span class="status status-{escape(validation.status)}">{escape(validation.status)}</span></p>
+<div class="metrics">
+<div class="metric"><span>Initial configuration</span>
+<strong><code>{escape(validation.baseline_config.describe())}</code></strong></div>
+<div class="metric"><span>Search candidate</span>
+<strong><code>{escape(validation.candidate_config.describe())}</code></strong></div>
+<div class="metric"><span>Initial median</span><strong>{escape(baseline_median)}</strong></div>
+<div class="metric"><span>Candidate median</span><strong>{escape(candidate_median)}</strong></div>
+<div class="metric"><span>Observed gain</span>
+<strong>{escape(_fmt_percent(validation.improvement_percent))}</strong></div>
+<div class="metric"><span>95% interval</span>
+<strong>{escape(_fmt_interval(validation))}</strong></div>
+</div>
+<p><strong>Minimum practical gain:</strong>
+{validation.min_improvement_percent:.1f}%</p>
+<p><strong>Decision:</strong> {escape(validation.reason)}</p>
+<p><strong>Final recommendation:</strong>
+<code>{escape(self.best_config.describe())}</code></p>
+{search_note}
+{observations_html}
+{failures_html}
+</section>"""
+
+    def _order_html(self) -> str:
+        escape = html.escape
+        measured = [item for item in self.round_orders if item.measured]
+        if not measured:
+            return ""
+        rows = []
+        for order in measured:
+            configs = "<br>".join(
+                f"<code>{escape(config.describe())}</code>" for config in order.configs
+            )
+            rows.append(
+                f"<tr><td>{escape(order.phase)}</td><td>{order.round_index + 1}</td>"
+                f"<td>{configs}</td></tr>"
+            )
+        return (
+            "<section><h2>Measured execution order</h2>"
+            '<p class="muted">Warmup rounds are discarded and listed in the JSON report.</p>'
+            '<div class="table-wrap"><table><thead><tr>'
+            "<th>Phase</th><th>Round</th><th>Configurations in execution order</th>"
+            "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div></section>"
+        )
+
     def best_measurement_batches(self) -> int:
         measurement = self._measurement_for(self.best_config)
         return measurement.passes[0].batches if measurement.passes else 0
+
+    def _batch_size_text(self) -> str:
+        if self.loader_template is not None and self.loader_template.unbatched:
+            return "unbatched"
+        if self.settings.batch_size is not None:
+            return str(self.settings.batch_size)
+        return "custom batch_sampler"
+
+    def _loader_details(self) -> dict[str, Any] | None:
+        template = self.loader_template
+        if template is None:
+            return None
+        return {
+            "dataset": type(template.dataset).__name__,
+            "batch_size": template.batch_size,
+            "unbatched": template.unbatched,
+            "sampler": type(template.sampler).__name__,
+            "batch_sampler": (
+                type(template.batch_sampler).__name__
+                if template.batch_sampler is not None
+                else None
+            ),
+            "collate_fn": getattr(
+                template.collate_fn, "__name__", type(template.collate_fn).__name__
+            ),
+            "drop_last": template.drop_last,
+            "timeout": template.timeout,
+            "worker_init_fn": (
+                getattr(template.worker_init_fn, "__name__", type(template.worker_init_fn).__name__)
+                if template.worker_init_fn is not None
+                else None
+            ),
+            "generator": template.generator is not None,
+            "multiprocessing_context": (
+                str(template.multiprocessing_context)
+                if template.multiprocessing_context is not None
+                else None
+            ),
+            "in_order": template.in_order,
+            "pin_memory_device": template.pin_memory_device or None,
+            "sample_count_fn": template.sample_count_fn is not None,
+        }
 
 
 _CSS = """
@@ -449,6 +736,8 @@ _CSS = """
   --accent: #0f766e;
   --accent-soft: #e7f4f1;
   --failed: #a61b1b;
+  --warning: #8a5a00;
+  --warning-soft: #fff4d6;
 }
 * { box-sizing: border-box; }
 body {
@@ -463,6 +752,7 @@ main { max-width: 1180px; margin: 0 auto; padding: 40px 24px 56px; }
 header { margin-bottom: 28px; }
 h1 { font-size: 30px; line-height: 1.15; margin: 4px 0 8px; letter-spacing: -0.02em; }
 h2 { font-size: 20px; margin: 0 0 14px; letter-spacing: -0.01em; }
+h3 { font-size: 16px; margin: 20px 0 8px; }
 section { margin: 28px 0; }
 p { margin: 10px 0; }
 code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 0.92em; }
@@ -482,6 +772,7 @@ code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size
   padding: 22px;
 }
 .card.accent { border-left: 4px solid var(--accent); background: var(--accent-soft); }
+.card.validation { border-left: 4px solid #355070; background: #f5f7fb; }
 .card h2 { margin-top: 6px; }
 .metrics {
   display: grid;
@@ -496,7 +787,7 @@ code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size
   padding: 10px 12px;
 }
 .metric span { display: block; font-size: 12px; color: var(--muted); }
-.metric strong { font-size: 17px; font-variant-numeric: tabular-nums; }
+.metric strong { font-size: 15px; font-variant-numeric: tabular-nums; }
 .table-wrap {
   overflow-x: auto;
   background: var(--card);
@@ -522,6 +813,20 @@ tr.recommended td { background: #f0faf7; }
 td.rank { font-weight: 700; color: var(--accent); }
 table.kv th { width: 210px; text-transform: none; letter-spacing: 0; font-size: 13px; }
 .error { color: var(--failed); white-space: pre-wrap; }
+.status {
+  display: inline-block;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.status-confirmed { background: #d7f1e8; color: #0b5d4f; }
+.status-inconclusive { background: var(--warning-soft); color: var(--warning); }
+.status-regression { background: #f9dddd; color: var(--failed); }
+.status-not_needed { background: #e3e8ef; color: #445064; }
+.status-not_possible { background: #f1e6f8; color: #64327e; }
 ul { margin: 8px 0; padding-left: 22px; }
 li { margin: 7px 0; }
 footer {
@@ -549,6 +854,18 @@ def _fmt_mib(value: int | None) -> str:
     if value is None:
         return "n/a"
     return f"{value / (1024**2):,.1f} MiB"
+
+
+def _fmt_percent(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:+.1f}%"
+
+
+def _fmt_interval(validation: ValidationResult) -> str:
+    if validation.ci_low_percent is None or validation.ci_high_percent is None:
+        return "n/a"
+    return f"[{validation.ci_low_percent:+.1f}%, {validation.ci_high_percent:+.1f}%]"
 
 
 def _memory_text(summary: MetricsSummary) -> str:

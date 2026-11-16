@@ -8,29 +8,31 @@
 
 The package name is `apdo`. The command-line interface is also `apdo`.
 
-## The problem
+## Why APDO
 
-DataLoader throughput depends on the dataset, storage, CPU topology, operating system, worker process behavior, and the device receiving the batches. Published rules of thumb and configurations tuned on another machine often perform worse than the default.
+DataLoader throughput depends on the dataset, storage, preprocessing cost, CPU topology, operating system, worker process behavior, and the device receiving the batches. Published rules of thumb and configurations tuned on another machine often perform worse than the default.
 
-`apdo` runs the real loader, records repeated measurements, and selects a configuration using those measurements. It does not estimate performance from hardware specifications, and it does not call a cloud service.
+APDO runs the real loader, records repeated measurements, validates the search recommendation with fresh measurements, and retains the initial configuration when a gain is not confirmed. It does not estimate performance from hardware specifications and does not call a cloud service.
 
-## Features in v0.1.0
+## Features in v0.2.0
 
-- Benchmarks map-style PyTorch datasets on CPU or CUDA.
-- Searches `num_workers`, `pin_memory`, `prefetch_factor`, and `persistent_workers` with a two-stage grid.
-- Measures startup latency, steady-state throughput, per-batch latency, parent-process RSS and system memory growth on Windows and Linux, and CUDA allocation during tensor copies.
-- Excludes failed configurations instead of treating them as valid results.
-- Selects a stable configuration with bootstrap confidence intervals and a preference for simpler settings.
-- Exports a structured JSON report and a self-contained HTML report.
-- Provides a Python API and an `apdo benchmark` command.
-- Runs locally without authentication or external APIs.
+- Optimizes an existing map-style dataset with a batch size, or an existing `DataLoader`.
+- Preserves the original loader's dataset, batch size, sampler, batch sampler, collate function, `drop_last`, timeout, worker initialization, generator, multiprocessing context, and `in_order` setting.
+- Changes only `num_workers`, `pin_memory`, `prefetch_factor`, and `persistent_workers`.
+- Runs seeded, balanced rounds and records the executed configuration order and every per-round measurement.
+- Runs independent paired validation instead of treating the search result as proof.
+- Returns `confirmed`, `inconclusive`, `regression`, `not_needed`, or `not_possible` validation outcomes.
+- Falls back to the initial configuration unless validation confirms the required minimum gain.
+- Supports optional time budgets and custom sample counting for unusual collate functions.
+- Generates a schema-v2 JSON report and a self-contained HTML report with validation, ranking, execution order, environment, method, and limitations.
+- Provides three deterministic local workloads for serious tuning runs without adding slow benchmarks to CI.
 
 ## Installation
 
-v0.1.0 is released on GitHub. PyPI publication is not part of this release.
+v0.2.0 is distributed through GitHub Releases. PyPI publication is not part of this release.
 
 ```bash
-pip install "git+https://github.com/OmegaMc1331/automatic-pytorch-dataloader-optimizer.git@v0.1.0"
+pip install "git+https://github.com/OmegaMc1331/automatic-pytorch-dataloader-optimizer.git@v0.2.0"
 ```
 
 For development from a clone:
@@ -44,192 +46,251 @@ python -m pip install -e ".[dev]"
 Requirements:
 
 - Python 3.10 or newer. Python 3.10 through 3.14 are tested.
-- PyTorch 2.10 or newer. PyTorch 2.10 and 2.15 are tested.
+- PyTorch 2.10 or newer.
 - CPU-only and CUDA systems are supported. CUDA measurements require a working CUDA PyTorch build and driver.
+- Map-style datasets only. `IterableDataset` is rejected explicitly.
 
-## Python quick start
+## Python quick start: dataset
 
 ```python
-from pathlib import Path
-
 import torch
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import TensorDataset
 
 from apdo import optimize
 
+features = torch.randn(512, 32)
+labels = torch.randint(0, 10, (512,))
+dataset = TensorDataset(features, labels)
 
-def main() -> None:
-    features = torch.randn(512, 32)
-    labels = torch.randint(0, 10, (512,))
-    dataset = TensorDataset(features, labels)
+result = optimize(
+    dataset,
+    batch_size=32,
+    device="cpu",
+    rounds=3,
+    validation_rounds=5,
+    max_batches=50,
+)
+print(result.summary())
 
-    result = optimize(
-        dataset,
-        batch_size=32,
-        device="cpu",
-        max_ram_gb=2,
-        max_batches=50,
-    )
-    print(result.summary())
-
-    loader = DataLoader(
-        dataset,
-        batch_size=32,
-        **result.best_config.to_dataloader_kwargs(),
-    )
-    batch = next(iter(loader))
-    print(len(batch), batch[0].shape)
-
-    result.to_json(Path("reports/benchmark.json"))
-    result.to_html(Path("reports/benchmark.html"))
-
-
-if __name__ == "__main__":
-    main()
+optimized_loader = result.build_dataloader()
+batch = next(iter(optimized_loader))
 ```
 
-On Windows, keep the `if __name__ == "__main__":` guard. DataLoader workers use the `spawn` start method there, and the guard prevents the benchmark from being re-executed in child processes.
-
-`device="auto"` resolves to CUDA when CUDA is available and to CPU otherwise. On CUDA, throughput includes blocking host-to-device copies of tensor values in each batch. It does not include a model forward or backward pass.
-
-The recommended configuration can be passed directly to a new loader:
+## Python quick start: existing DataLoader
 
 ```python
-config = result.best_config
-loader = DataLoader(train_dataset, batch_size=32, **config.to_dataloader_kwargs())
+from torch.utils.data import DataLoader
+
+from apdo import optimize
+
+original_loader = DataLoader(
+    dataset,
+    batch_size=64,
+    shuffle=True,
+    drop_last=True,
+    num_workers=2,
+)
+result = optimize(
+    dataloader=original_loader,
+    device="auto",
+    rounds=3,
+    validation_rounds=5,
+)
+
+print(result.validation.status)
+print(result.best_config.describe())
+optimized_loader = result.build_dataloader()
 ```
 
-`result.fastest_config` contains the empirically fastest configuration. It can differ from `result.best_config` when the fastest result's bootstrap interval overlaps that of a simpler configuration within the 5% materiality band.
+The original loader is not modified. APDO keeps the existing batch size and the loader behavior outside the four optimized options. A custom sampler, batch sampler, generator, or `worker_init_fn` is reused by reference, so mutable state can be shared with the original loader; the result includes a warning in that case.
 
-## Command line
+`optimize` also accepts the loader as its first positional argument:
 
-```bash
-apdo --help
-apdo --version
-apdo benchmark --help
+```python
+result = optimize(original_loader, device="cpu")
 ```
 
-A dataset factory is an importable zero-argument callable that returns a map-style dataset. The repository includes one at `examples/synthetic_dataset.py`:
+Dataset and loader inputs are mutually exclusive. A `batch_size` override is rejected for a loader with an existing batch size. `DataLoader` subclasses are rejected because APDO cannot verify that their behavior is preserved.
+
+### Preserved loader options
+
+For an existing `DataLoader`, APDO preserves:
+
+- `dataset`
+- `batch_size`
+- `sampler`
+- `batch_sampler`
+- `collate_fn`
+- `drop_last`
+- `timeout`
+- `worker_init_fn`
+- `generator`
+- `multiprocessing_context` when workers are enabled
+- `in_order`
+- `pin_memory_device` when pinning is enabled
+
+Only `num_workers`, `pin_memory`, `prefetch_factor`, and `persistent_workers` vary between candidates.
+
+## How the recommendation is produced
+
+1. A map-style dataset or loader is validated. The initial loader configuration becomes the safe fallback baseline.
+2. Stage 1 scans `num_workers` values with default prefetch settings and applicable `pin_memory` choices.
+3. Stage 2 varies `prefetch_factor` and `persistent_workers` for the two best multi-worker counts.
+4. Configurations are measured in seeded, balanced rounds. A discarded warmup round is followed by one measured pass per configuration per round. The executed order is recorded.
+5. The search selects the simplest configuration that is within 5% of the fastest median throughput and whose bootstrap interval overlaps the fastest interval.
+6. The initial and search-candidate configurations are measured again in balanced paired rounds. Search measurements are not reused.
+7. A paired bootstrap interval of relative gains determines the validation status.
+8. The candidate is recommended only when the observed median gain meets `min_improvement` and the 95% interval is above zero. Otherwise the initial configuration is retained.
+9. Validation that is stopped by the time budget before all planned rounds complete cannot confirm the candidate; the initial configuration is retained.
+
+### Validation statuses
+
+| Status | Meaning |
+| --- | --- |
+| `confirmed` | The candidate met the minimum gain and the paired interval is above zero. |
+| `inconclusive` | The candidate did not establish the required gain. The initial configuration is retained. |
+| `regression` | The candidate was slower in validation. The initial configuration is retained. |
+| `not_needed` | The search selected the initial configuration. |
+| `not_possible` | Validation was disabled, skipped by the time budget, failed, or had fewer than two paired rounds. The initial configuration is retained. |
+
+## Important `optimize()` parameters
+
+| Parameter | Default | Purpose |
+| --- | --- | --- |
+| `dataset` | `None` | Map-style dataset or existing `DataLoader`. |
+| `batch_size` | `32` for datasets | Required for dataset input; must match an existing loader if provided. |
+| `device` | `"auto"` | `"auto"`, `"cpu"`, `"cuda"`, or `"cuda:N"`. |
+| `warmup_runs` | `1` | Discarded warmup rounds per configuration. Must be at least 1. |
+| `repetitions` | `3` | Legacy number of measured search rounds. |
+| `rounds` | `None` | Measured balanced search rounds; overrides `repetitions`. |
+| `max_batches` | `100` | Batches per pass, or `None` for the full dataset. |
+| `max_workers` | available CPUs, up to 8 | Upper bound for the worker search. |
+| `seed` | `42` | Seed for execution order and bootstrap resampling. |
+| `validation` | `True` | Enables independent paired validation. |
+| `validation_rounds` | `5` | Paired rounds for validation. |
+| `min_improvement` | `0.05` | Required relative gain, as a fraction. |
+| `time_budget_s` | `None` | Approximate search budget, checked at round boundaries. |
+| `sample_count_fn` | `None` | Callable that returns the number of samples in a batch. |
+| `progress` | `None` | Callable receiving progress messages. |
+
+## CLI
+
+Dataset factory:
 
 ```bash
 apdo benchmark \
-  --dataset examples.synthetic_dataset:create_dataset \
+  --dataset my_project.data:build_dataset \
   --batch-size 32 \
   --device auto \
-  --max-ram-gb 4 \
-  --max-batches 100 \
-  --max-workers 8 \
-  --repetitions 3 \
-  --json benchmark.json \
-  --html benchmark.html
+  --rounds 3 \
+  --validation-rounds 5 \
+  --json report.json \
+  --html report.html
 ```
 
-The CLI adds the current working directory to the import path when it loads the factory. Modules are imported only when named explicitly on the command line; `apdo` does not evaluate configuration files or expressions.
+DataLoader factory:
 
-The factory module must be importable by worker processes as well. Define dataset and transform classes at module level, not inside a function or inside `if __name__ == "__main__":`.
+```bash
+apdo benchmark \
+  --dataset my_project.data:build_loader \
+  --device auto \
+  --no-validation \
+  --json loader-report.json
+```
 
-Benchmark options:
+The factory must be a zero-argument callable in an importable module. The current working directory is added to `sys.path`. On Windows, dataset classes must be defined at module level and guarded by the usual `if __name__ == "__main__"` pattern in scripts that start worker processes.
 
-| Option | Default | Meaning |
-| --- | --- | --- |
-| `--dataset MODULE:FACTORY` | required | Import path of a zero-argument dataset factory. |
-| `--batch-size N` | `32` | Batch size used for every configuration. |
-| `--device DEVICE` | `auto` | `auto`, `cpu`, `cuda`, or `cuda:N`. |
-| `--max-ram-gb GB` | none | Soft limit on observed system memory growth during a configuration. |
-| `--warmup-runs N` | `1` | Discarded passes before measured passes. |
-| `--repetitions N` | `3` | Measured passes per configuration. Minimum 2. |
-| `--max-batches N` | `100` | Maximum batches in each pass, including the first. Minimum 2. |
-| `--full-dataset` | off | Iterate every batch instead of applying `--max-batches`. |
-| `--max-workers N` | `min(8, available CPUs)` | Upper bound for the worker search. |
-| `--json PATH` | none | Write the JSON report. Parent directories are created. |
-| `--html PATH` | none | Write the standalone HTML report. Parent directories are created. |
+Useful options:
 
-Progress and warnings are written to stderr. The recommendation summary is written to stdout, so it can be redirected independently.
+- `--seed`
+- `--rounds`
+- `--repetitions`
+- `--validation-rounds`
+- `--min-improvement`
+- `--no-validation`
+- `--time-budget-s`
+- `--sample-count-fn MODULE:FACTORY`
+- `--max-batches` or `--full-dataset`
+- `--max-workers`
+- `--json PATH`
+- `--html PATH`
 
-## Parameters under test
+## Reports
 
-### `num_workers`
+JSON reports use schema version 2 and include:
 
-Candidate counts are drawn from `0, 1, 2, 4, 8`, plus the configured worker limit when it differs, capped by the available CPU count. The default limit is `min(8, available CPUs)`. Allowing more workers than CPUs is usually counterproductive and is not explored by default.
+- APDO version, start time, duration, protocol version, seed, rounds, budget state, and executed search/validation orders.
+- Environment, benchmark settings, loader preservation details, method, and limitations.
+- Baseline, search recommendation, fastest configuration, final recommendation, validation status, and final gain.
+- Per-configuration per-round metrics, aggregate summaries, and failures.
+- Complete validation observations and bootstrap results.
 
-### `pin_memory`
+HTML reports are self-contained, contain no remote assets, escape benchmark data, and include a dedicated `Recommendation Validation` section.
 
-`pin_memory` is explored only when the resolved device is CUDA. Pinning on a CPU-only run has no transfer path to improve, so only `False` is tested. CUDA configurations with and without pinning are compared using actual host-to-device copies.
+## When the candidate is not confirmed
 
-### `prefetch_factor`
+The final recommendation is safe by default. If validation is inconclusive, regresses, is disabled, or cannot run, `result.best_config` remains the initial configuration. The search candidate and search gain remain available in `result.search_candidate_config` and `result.search_improvement_percent` for inspection.
 
-`prefetch_factor` is only legal when `num_workers > 0`. The search compares values `2` and `4`.
+```python
+if result.validation.status != "confirmed":
+    print("Using the original configuration:", result.best_config.describe())
+    print("Search candidate was:", result.search_candidate_config.describe())
+```
 
-### `persistent_workers`
+## Benchmark workloads
 
-`persistent_workers` is only legal when `num_workers > 0`. Both values are tested for the selected worker counts in the second stage.
+The repository includes three deterministic local workloads designed for tuning sessions rather than CI:
 
-The default PyTorch configuration, `num_workers=0` with `pin_memory=False`, is always included and serves as the baseline for the reported improvement.
+- `in-memory`: preloaded tensor features with light preprocessing.
+- `disk-backed`: generated local binary records with deterministic random access.
+- `cpu-heavy`: per-sample matrix operations that make worker parallelism visible.
 
-## How the benchmark works
+Run all workloads:
 
-1. The dataset is checked for map-style access and a positive length. A run needs at least two batches. Fewer than four batches produces a warning because startup effects and noise are difficult to separate.
-2. A first-stage grid scans worker counts with `prefetch_factor=2`, `persistent_workers=False`, and both applicable pinning values. The default configuration is included.
-3. The two best multi-worker counts by median throughput are refined in a second stage over `prefetch_factor` and `persistent_workers`.
-4. Each configuration receives one or more discarded warmup passes, followed by at least two measured passes.
-5. Cold start includes loader construction and the first worker startup. The startup statistic in each measured pass begins at `iter(loader)`, so it includes worker restarts for non-persistent loaders and iterator setup for persistent and single-process loaders. Steady-state throughput excludes the first batch, so initialization is reported separately from sustained loading.
-6. Batch latency is measured around each steady-state `next(iterator)` call, including host-to-device copies on CUDA.
-7. A background sampler records parent-process RSS and system-wide available memory every 50 ms on Windows and Linux. `max_ram_gb` compares observed system memory growth against the limit and stops the affected configuration when it is exceeded.
-8. Configurations are benchmarked sequentially in the same process. Failed configurations are retained in the report with their error details and are excluded from selection.
-9. The recommendation is the simplest configuration whose median throughput is within 5% of the fastest median and whose 95% bootstrap interval overlaps the fastest interval. Simplicity is ordered by fewer workers, no pinning, non-persistent workers, and lower prefetch.
+```bash
+python benchmarks/run_workloads.py
+```
 
-All timings use `time.perf_counter()`. Throughput is reported in samples per second, not batches per second and not training iterations per second.
+Fast smoke run:
 
-## Interpreting the result
+```bash
+python benchmarks/run_workloads.py --workload in-memory --rounds 2 --validation-rounds 2 --max-batches 10
+```
 
-`result.summary()` prints the recommended configuration, measured throughput, batch latencies, startup cost, observed memory, baseline improvement, and the reason for the selection. `result.to_dict()` exposes the same data in structured form.
-
-A recommended configuration with fewer workers than `result.fastest_config` is not a mistake. A simpler configuration was also within 5% of the fastest median throughput and its 95% bootstrap interval overlapped the fastest interval, so the simpler configuration is preferred.
-
-A warning that only one configuration succeeded means no comparison was possible. A warning about too few batches means the measurement window was short. Treat both cases as weak evidence.
-
-The numbers are specific to the current machine, dataset, storage state, batch size, and system load. They are useful for choosing settings on that machine; they are not a general benchmark of PyTorch or of a model.
-
-## Limitations in v0.1.0
-
-- Only map-style datasets with `__len__` and `__getitem__` are supported. `IterableDataset` is rejected.
-- Custom samplers, `collate_fn`, `worker_init_fn`, `drop_last`, `timeout`, and transforms that depend on loader options are not part of the search. The benchmark uses the dataset as provided and PyTorch's default collation.
-- No model is executed. Throughput covers loading and, on CUDA, tensor copies to the device. It says nothing about training or inference speed.
-- The grid is not exhaustive. Worker counts above `max_workers` are not considered, and interactions outside the staged search are not tested.
-- `max_ram_gb` is a soft, sampled guard, not a reservation or a hard cgroup limit. Allocations between samples, memory held by other processes, and page-cache behavior affect what is observed. Parent-process RSS does not include worker processes; system-wide available memory is used to observe their effect indirectly.
-- Parent-process RSS is absolute and can include memory retained from earlier configurations. Memory sampling is implemented for Windows and Linux.
-- The same dataset object is reused across configurations. Dataset caching, state changes, or storage warm-up can make later configurations appear faster.
-- Configurations run sequentially and in a deterministic order. Machine load that changes during the benchmark can favor earlier or later configurations.
-- Bootstrap intervals describe variation across the measured passes. Interval overlap is an equivalence heuristic, not a formal hypothesis test. Intervals do not model variation from random transforms, changing storage caches, or other long-running system effects.
-- The search is single-device. Multi-GPU transfers and distributed data loading are not measured.
-- Only CPU and CUDA devices are accepted. MPS and other accelerator types are not supported in v0.1.0. On macOS, only total physical memory is reported and `max_ram_gb` cannot be enforced.
-- `pin_memory` benefits are only observable when batches contain tensors and the resolved device is CUDA. A warning is reported when no tensors were transferred.
-- Windows is supported and tested with multiprocessing `spawn`, but datasets and transforms must be importable from a module so worker processes can reconstruct them.
-- CI covers lint, formatting, packaging, and CPU tests on Linux and Windows. The CUDA integration test runs locally on CUDA hardware and is not part of CI. macOS is not covered by CI in v0.1.0.
+Generated data and reports are written to ignored directories under `benchmarks/.cache/` and `benchmarks/results/`. The workloads require no network access.
 
 ## Development
 
 ```bash
 python -m pip install -e ".[dev]"
-ruff check .
-ruff format --check .
-pytest
-pytest -m cuda          # only where a CUDA device is available
-python -m build
-twine check dist/*
+python -m ruff check src tests benchmarks examples
+python -m ruff format --check src tests benchmarks examples
+python -m pytest
 ```
 
-The CUDA integration test is marked `cuda` and skipped when `torch.cuda.is_available()` is false. CPU tests exercise real `DataLoader` processes, including a failing worker, and a full `optimize()` run on a synthetic dataset.
+CUDA tests are marked and can be deselected on CPU-only machines:
 
-The CI workflow runs lint, format checks, CPU tests, a Windows test job, and package build checks. The test matrix covers Python 3.10 through 3.14, using PyTorch 2.10 on Python 3.10 through 3.13 and PyTorch 2.15 on Python 3.14.
+```bash
+python -m pytest -m "not cuda"
+```
 
-## Contributing
+Build and inspect the release artifacts:
 
-Bug reports and pull requests are welcome at
-<https://github.com/OmegaMc1331/automatic-pytorch-dataloader-optimizer/issues>.
+```bash
+python -m build
+python -m twine check dist/*
+```
 
-Please include the operating system, Python version, PyTorch version, CPU model, dataset characteristics, and command line with any performance report. Keep changes covered by tests and run the lint and test commands above before opening a pull request.
+## Compatibility and limitations
 
-## License
+- v0.1.0 calls to `optimize(dataset, batch_size=...)` remain supported.
+- The two-stage search, bootstrap selection, memory guard, CUDA transfer measurement, CLI, and reports remain available.
+- v0.2.0 changes the JSON schema to version 2 and adds validation fields.
+- Only map-style datasets with `__len__` and `__getitem__` are supported.
+- Validation confirms a gain for the measured workload; it is not a universal guarantee.
+- Measurements cover data loading and CUDA host-to-device copies, not model training.
+- `max_ram_gb` is a sampled guard, not a hard memory limit.
+- APDO does not reset dataset, sampler, transform, global RNG state, or GPU memory pools.
+- macOS is not covered by CI in this release.
 
-MIT. See [LICENSE](LICENSE).
+See `CHANGELOG.md` for release history. Licensed under MIT.
