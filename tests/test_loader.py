@@ -7,6 +7,7 @@ from torch.utils.data import (
     DataLoader,
     IterableDataset,
     RandomSampler,
+    Sampler,
     SequentialSampler,
     TensorDataset,
 )
@@ -14,6 +15,7 @@ from torch.utils.data import (
 from apdo import LoaderConfig
 from apdo.errors import ConfigurationError, DatasetError
 from apdo.loader import (
+    LoaderSource,
     LoaderTemplate,
     compatibility_warnings,
     initial_loader_config,
@@ -210,11 +212,12 @@ def test_compatibility_warnings_describe_shared_state() -> None:
         worker_init_fn=lambda worker_id: None,
     )
 
-    warnings = compatibility_warnings(LoaderTemplate.from_dataloader(loader))
+    template = LoaderTemplate.from_dataloader(loader)
+    warnings = compatibility_warnings(template)
+    info = template.isolation_info()
 
-    assert any("random sampler" in warning for warning in warnings)
-    assert any("generator object" in warning for warning in warnings)
-    assert any("transform" in warning for warning in warnings)
+    assert info.status == "partial"
+    assert any("randomness" in warning for warning in warnings)
     assert any("worker_init_fn" in warning for warning in warnings)
 
 
@@ -225,4 +228,70 @@ def test_custom_batch_sampler_warns_about_shared_state() -> None:
 
     warnings = compatibility_warnings(template)
 
-    assert any("batch_sampler" in warning for warning in warnings)
+    assert warnings == []
+    assert template.isolation_info().status == "verified"
+    assert "sampler" in template.isolation_info().managed
+    assert "batch_sampler" in template.isolation_info().managed
+
+
+class StatefulSampler(Sampler[int]):
+    def __init__(self, size: int) -> None:
+        self.size = size
+        self.offset = 0
+
+    def __iter__(self):
+        indices = list(range(self.size))
+        self.offset += 1
+        return iter(indices[self.offset % 2 :] + indices[: self.offset % 2])
+
+    def __len__(self) -> int:
+        return self.size
+
+
+def test_isolated_build_clones_generator_and_preserves_original() -> None:
+    dataset = make_dataset()
+    generator = torch.Generator().manual_seed(9)
+    loader = DataLoader(dataset, batch_size=2, generator=generator)
+    template = LoaderTemplate.from_dataloader(loader)
+    state_before = generator.get_state().clone()
+
+    built = template.build(LoaderConfig(), isolate=True)
+    assert built.generator is not None
+    assert built.generator is not generator
+    assert torch.equal(built.generator.get_state(), state_before)
+
+    next(iter(built))
+
+    assert torch.equal(generator.get_state(), state_before)
+
+
+def test_isolated_build_falls_back_to_custom_sampler() -> None:
+    dataset = make_dataset()
+    sampler = StatefulSampler(len(dataset))
+    loader = DataLoader(dataset, batch_size=2, sampler=sampler)
+    template = LoaderTemplate.from_dataloader(loader)
+
+    built = template.build(LoaderConfig(), isolate=True)
+    info = template.isolation_info()
+
+    assert built.sampler is sampler
+    assert info.status == "not_guaranteed"
+    assert not info.training_allowed
+
+
+def test_loader_source_from_factory_enforces_contract() -> None:
+    def factory(config: LoaderConfig) -> DataLoader:
+        return DataLoader(make_dataset(), batch_size=2, **config.to_dataloader_kwargs())
+
+    source = LoaderSource.from_factory(factory, sample_count_fn=None)
+
+    assert source.input_kind == "dataloader_factory"
+    assert source.isolation.status == "factory_managed"
+    assert source.isolation.training_allowed
+    assert source.build(LoaderConfig()).batch_size == 2
+
+    def invalid(config: LoaderConfig) -> DataLoader:
+        return DataLoader(make_dataset(), batch_size=2, num_workers=1)
+
+    with pytest.raises(ConfigurationError, match="honor"):
+        LoaderSource.from_factory(invalid, sample_count_fn=None)

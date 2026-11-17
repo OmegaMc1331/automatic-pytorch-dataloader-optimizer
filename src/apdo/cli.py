@@ -35,26 +35,83 @@ def build_parser() -> argparse.ArgumentParser:
         "benchmark",
         help="benchmark candidate DataLoader configurations",
         description=(
-            "Load a map-style dataset or an existing DataLoader from an importable "
-            "factory, benchmark DataLoader settings, validate the recommendation, "
-            "and print the result."
+            "Load a map-style dataset, an existing DataLoader, or an explicit "
+            "DataLoader factory, benchmark loader or end-to-end training settings, "
+            "validate the recommendation, and print the result."
         ),
         epilog=(
-            "Example:\n"
+            "Examples:\n"
             "  apdo benchmark --dataset my_project.data:build_loader "
-            "--device auto --json report.json --html report.html\n\n"
-            "The factory must be importable from the current working directory and "
-            "must be a zero-argument callable returning a map-style PyTorch dataset "
-            "or a torch.utils.data.DataLoader. On Windows, classes must be defined at "
-            "module level so worker processes can import them."
+            "--device auto --json report.json --html report.html\n"
+            "  apdo benchmark --factory my_project.data:make_loader --mode training "
+            "--training-step-factory my_project.train:make_step --epochs 3\n\n"
+            "Dataset factories are zero-argument callables returning a map-style "
+            "dataset or DataLoader. Dataloader factories accept one LoaderConfig "
+            "argument and return an independent DataLoader. Training step factories "
+            "are zero-argument callables returning a step(batch) callable that performs "
+            "forward, loss, backward, and optimizer work. On Windows, classes must be "
+            "defined at module level so worker processes can import them."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    benchmark.add_argument(
+    input_group = benchmark.add_mutually_exclusive_group(required=True)
+    input_group.add_argument(
         "--dataset",
-        required=True,
         metavar="MODULE:FACTORY",
         help="import path of a zero-argument dataset or DataLoader factory",
+    )
+    input_group.add_argument(
+        "--factory",
+        metavar="MODULE:FACTORY",
+        help=(
+            "import path of a callable accepting LoaderConfig and returning an "
+            "independent DataLoader"
+        ),
+    )
+    benchmark.add_argument(
+        "--mode",
+        choices=("loader", "training"),
+        default="loader",
+        help="benchmark DataLoader only or end-to-end training (default: loader)",
+    )
+    benchmark.add_argument(
+        "--epochs",
+        type=_positive_int,
+        default=None,
+        help="epochs per trial; default 1 in loader mode and 3 in training mode",
+    )
+    benchmark.add_argument(
+        "--training-step-factory",
+        metavar="MODULE:FACTORY",
+        default=None,
+        help="import path of a zero-argument training step factory",
+    )
+    benchmark.add_argument(
+        "--training-rounds",
+        type=_at_least_two,
+        default=2,
+        help="measured training finalist rounds (default: 2)",
+    )
+    benchmark.add_argument(
+        "--training-validation-rounds",
+        type=_at_least_two,
+        default=None,
+        help="paired validation rounds in training mode (default: validation rounds)",
+    )
+    benchmark.add_argument(
+        "--max-training-candidates",
+        type=_positive_int,
+        default=3,
+        help="maximum end-to-end training finalists (default: 3)",
+    )
+    benchmark.add_argument(
+        "--validation-policy",
+        choices=("minimum", "positive"),
+        default="minimum",
+        help=(
+            "minimum: lower 95%% bound must reach min-improvement; "
+            "positive: lower bound must exceed zero (default: minimum)"
+        ),
     )
     benchmark.add_argument(
         "--batch-size",
@@ -183,7 +240,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def _run_benchmark(args: argparse.Namespace) -> int:
     try:
-        data = _load_dataset(args.dataset)
+        data = _load_dataset(args.dataset) if args.dataset is not None else None
+        dataloader_factory = (
+            _load_attribute(args.factory, "loader factory") if args.factory is not None else None
+        )
+        training_step_factory = (
+            _load_attribute(args.training_step_factory, "training step factory")
+            if args.training_step_factory is not None
+            else None
+        )
         sample_count_fn = (
             _load_factory(args.sample_count_fn, "sample-count")
             if args.sample_count_fn is not None
@@ -202,6 +267,14 @@ def _run_benchmark(args: argparse.Namespace) -> int:
             batch_size=args.batch_size,
             device=args.device,
             max_ram_gb=args.max_ram_gb,
+            dataloader_factory=dataloader_factory,
+            mode=args.mode,
+            epochs=args.epochs,
+            training_step_factory=training_step_factory,
+            training_rounds=args.training_rounds,
+            training_validation_rounds=args.training_validation_rounds,
+            max_training_candidates=args.max_training_candidates,
+            validation_policy=args.validation_policy,
             warmup_runs=args.warmup_runs,
             repetitions=args.repetitions,
             rounds=args.rounds,
@@ -240,7 +313,7 @@ def _load_dataset(specification: str) -> Any:
     return _load_factory(specification, "dataset")
 
 
-def _load_factory(specification: str, kind: str) -> Any:
+def _load_attribute(specification: str, kind: str) -> Any:
     module_name, separator, attribute = specification.partition(":")
     if not separator or not module_name or not attribute:
         raise _CliError(f"invalid {kind} specification {specification!r}; expected MODULE:FACTORY")
@@ -256,12 +329,16 @@ def _load_factory(specification: str, kind: str) -> Any:
             f"could not import {kind} module {module_name!r}: {type(exc).__name__}: {exc}"
         ) from exc
 
-    factory = getattr(module, attribute, None)
-    if factory is None:
+    value = getattr(module, attribute, None)
+    if value is None:
         raise _CliError(f"{kind} module {module_name!r} has no attribute {attribute!r}")
-    if not callable(factory):
+    if not callable(value):
         raise _CliError(f"{kind} attribute {module_name}:{attribute} is not callable")
+    return value
 
+
+def _load_factory(specification: str, kind: str) -> Any:
+    factory = _load_attribute(specification, kind)
     try:
         return factory()
     except Exception as exc:

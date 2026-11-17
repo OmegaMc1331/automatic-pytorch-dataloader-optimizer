@@ -4,7 +4,10 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
+from torch import nn
 from torch.utils.data import DataLoader, Dataset
+
+from apdo import LoaderConfig
 
 
 class SyntheticDataset(Dataset):
@@ -35,9 +38,41 @@ def create_loader() -> DataLoader:
     )
 
 
+def create_training_loader(config: LoaderConfig) -> DataLoader:
+    return DataLoader(
+        SyntheticDataset(size=128),
+        batch_size=16,
+        drop_last=True,
+        **config.to_dataloader_kwargs(),
+    )
+
+
+def create_training_step_factory(device: str = "cpu") -> Callable[[], Callable[[Any], None]]:
+    resolved_device = torch.device(device)
+    loss_fn = nn.CrossEntropyLoss()
+
+    def factory() -> Callable[[Any], None]:
+        model = nn.Linear(32, 10).to(resolved_device)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+        def step(batch: tuple[torch.Tensor, torch.Tensor]) -> None:
+            features, labels = batch
+            optimizer.zero_grad(set_to_none=True)
+            loss = loss_fn(model(features), labels)
+            loss.backward()
+            optimizer.step()
+
+        return step
+
+    return factory
+
+
 def count_batch(batch: tuple[torch.Tensor, torch.Tensor]) -> int:
     return int(batch[0].shape[0])
 
 
 def create_sample_counter() -> Callable[[Any], int]:
     return count_batch
+
+
+training_step_factory = create_training_step_factory("cpu")

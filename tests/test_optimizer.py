@@ -4,13 +4,13 @@ from dataclasses import replace
 
 import pytest
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 
 import apdo.optimizer as optimizer_module
 from apdo import LoaderConfig, optimize
 from apdo.benchmark import BatchPlan, RoundMeasurement, StageResult
 from apdo.errors import BenchmarkError, ConfigurationError
-from apdo.loader import LoaderTemplate, initial_loader_config
+from apdo.loader import LoaderSource, LoaderTemplate, initial_loader_config
 from apdo.optimizer import (
     _build_worker_counts,
     _finalist_workers,
@@ -398,3 +398,143 @@ def test_optimize_reports_exhausted_time_budget() -> None:
     assert result.budget_exhausted
     assert result.best_config == result.settings.initial_config
     assert any("time budget" in warning.lower() for warning in result.warnings)
+
+
+class StatefulSampler(Sampler[int]):
+    def __init__(self, size: int) -> None:
+        self.size = size
+
+    def __iter__(self):
+        return iter(range(self.size))
+
+    def __len__(self) -> int:
+        return self.size
+
+
+def test_validation_uses_explicit_source_instead_of_template(monkeypatch) -> None:
+    template = LoaderTemplate.from_dataset(SyntheticDataset(size=16, feature_dim=4), 4)
+    source = LoaderSource.from_template(template, "dataloader")
+    calls: list[str] = []
+
+    def fake_source(*args, **kwargs):
+        calls.append("source")
+        return StageResult(
+            measurements=(
+                make_measurement(LoaderConfig(), (100.0, 100.0)),
+                make_measurement(LoaderConfig(1), (120.0, 120.0)),
+            ),
+            orders=(),
+            budget_exhausted=False,
+        )
+
+    def fake_rounds(*args, **kwargs):
+        calls.append("rounds")
+        return StageResult(measurements=(), orders=(), budget_exhausted=False)
+
+    monkeypatch.setattr(optimizer_module, "benchmark_source", fake_source)
+    monkeypatch.setattr(optimizer_module, "benchmark_rounds", fake_rounds)
+    optimizer_module._run_validation(
+        template=template,
+        source=source,
+        baseline_config=LoaderConfig(),
+        candidate_config=LoaderConfig(1),
+        enabled=True,
+        validation_rounds=2,
+        warmup_rounds=0,
+        min_improvement=0.05,
+        device=torch.device("cpu"),
+        plan=BatchPlan(batches=4, steady_samples=12),
+        max_ram_bytes=None,
+        seed=1,
+        deadline=None,
+        progress=None,
+    )
+
+    assert calls == ["source"]
+
+
+def test_training_mode_requires_factory() -> None:
+    with pytest.raises(ConfigurationError, match="training_step_factory"):
+        optimize(
+            SyntheticDataset(size=16, feature_dim=4),
+            batch_size=4,
+            device="cpu",
+            mode="training",
+            max_batches=2,
+            max_workers=1,
+        )
+
+
+def test_training_mode_rejects_unverifiable_loader_state() -> None:
+    loader = DataLoader(
+        SyntheticDataset(size=16, feature_dim=4),
+        batch_size=4,
+        sampler=StatefulSampler(16),
+    )
+
+    with pytest.raises(ConfigurationError, match="reproducible training environment"):
+        optimize(
+            dataloader=loader,
+            device="cpu",
+            mode="training",
+            training_step_factory=lambda: lambda batch: None,
+            warmup_runs=1,
+            repetitions=2,
+            validation=False,
+            max_batches=2,
+            max_workers=1,
+        )
+
+
+def test_training_mode_optimizes_end_to_end() -> None:
+    def step(batch: object) -> None:
+        return None
+
+    result = optimize(
+        SyntheticDataset(size=16, feature_dim=4),
+        batch_size=4,
+        device="cpu",
+        mode="training",
+        epochs=2,
+        training_step_factory=lambda: step,
+        warmup_runs=1,
+        repetitions=2,
+        training_rounds=2,
+        validation=False,
+        max_batches=2,
+        max_workers=1,
+        seed=3,
+    )
+
+    assert result.settings.benchmark_mode == "training"
+    assert result.settings.epochs == 2
+    assert result.settings.input_kind == "dataset"
+    assert any(item.succeeded and item.training for item in result.measurements)
+    assert result.selection_reason
+    payload = result.to_dict()
+    assert payload["training"]["epochs"] == 2
+    assert payload["search"]["throughput_kind"] == "end_to_end_training"
+
+
+def test_optimize_accepts_dataloader_factory_and_rebuilds_with_it() -> None:
+    dataset = SyntheticDataset(size=16, feature_dim=4)
+
+    def factory(config: LoaderConfig) -> DataLoader:
+        return DataLoader(dataset, batch_size=4, **config.to_dataloader_kwargs())
+
+    result = optimize(
+        dataloader_factory=factory,
+        device="cpu",
+        warmup_runs=1,
+        repetitions=2,
+        validation=False,
+        max_batches=2,
+        max_workers=1,
+        seed=3,
+    )
+
+    assert result.settings.input_kind == "dataloader_factory"
+    assert result.loader_source is not None
+    built = result.build_dataloader()
+    assert built.batch_size == 4
+    assert built.num_workers == result.best_config.num_workers

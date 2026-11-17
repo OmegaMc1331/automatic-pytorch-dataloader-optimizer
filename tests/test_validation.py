@@ -141,3 +141,45 @@ def test_failures_are_preserved_in_validation_result() -> None:
 
     assert result.failures == ("worker failed",)
     assert result.to_dict()["failures"] == ["worker failed"]
+
+
+def test_minimum_policy_requires_interval_to_reach_threshold() -> None:
+    gains = (0.049, 0.049, 0.051, 0.051, 0.30)
+    minimum = analyze_validation(
+        BASELINE,
+        CANDIDATE,
+        observations(*gains),
+        enabled=True,
+        min_improvement=0.05,
+        seed=17,
+        policy="minimum",
+    )
+    positive = analyze_validation(
+        BASELINE,
+        CANDIDATE,
+        observations(*gains),
+        enabled=True,
+        min_improvement=0.05,
+        seed=17,
+        policy="positive",
+    )
+
+    assert minimum.status == "inconclusive"
+    assert not minimum.threshold_guaranteed
+    assert positive.status == "confirmed"
+    assert positive.ci_low_percent == pytest.approx(4.9)
+    assert not positive.threshold_guaranteed
+    assert positive.to_dict()["policy"] == "positive"
+
+
+def test_invalid_validation_policy_is_rejected() -> None:
+    with pytest.raises(ValueError, match="validation policy"):
+        analyze_validation(
+            BASELINE,
+            CANDIDATE,
+            observations(0.10, 0.10),
+            enabled=True,
+            min_improvement=0.05,
+            seed=17,
+            policy="strict",
+        )

@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from apdo._version import __version__
 from apdo.benchmark import ConfigMeasurement
 from apdo.config import BenchmarkSettings, LoaderConfig
-from apdo.loader import LoaderTemplate
+from apdo.loader import LoaderSource, LoaderTemplate
 from apdo.metrics import MetricsSummary
 from apdo.order import RoundOrder
 from apdo.resources import EnvironmentInfo
@@ -20,16 +20,21 @@ from apdo.validation import ValidationResult
 
 METHOD = {
     "protocol": (
-        "Benchmark protocol 2.0. Search configurations are measured in seeded, "
-        "balanced rounds. Each configuration receives discarded warmup rounds followed "
-        "by one measured pass per round. The executed order is recorded."
+        "Benchmark protocol 3.0. Search configurations run in loaded, seeded, balanced "
+        "rounds. Loader trials reuse one DataLoader across the configured epochs; each "
+        "trial is wrapped in global RNG state isolation. Training mode adds an explicit "
+        "end-to-end finalist stage. The executed order is recorded."
     ),
     "search": (
-        "Two-stage grid search. Stage 1 scans num_workers with default prefetch "
-        "settings and applicable pin_memory values. Stage 2 varies prefetch_factor "
-        "and persistent_workers for the two best multi-worker counts."
+        "Two-stage loader grid search followed, in training mode, by a progressive "
+        "end-to-end stage. Training finalists contain the initial configuration, the "
+        "loader-selected candidate, the loader-fastest candidate, and the fastest "
+        "remaining configurations up to the configured limit."
     ),
-    "selection_metric": "Median steady-state throughput across balanced measured rounds.",
+    "selection_metric": (
+        "Loader mode uses median sustained loader throughput across balanced rounds. "
+        "Training mode selects on median sustained end-to-end training throughput."
+    ),
     "uncertainty": (
         "95% percentile bootstrap interval of the median throughput from measured "
         "rounds. Validation uses a paired bootstrap interval of per-round relative gains."
@@ -38,9 +43,9 @@ METHOD = {
         "The search favors the simplest configuration whose median throughput is within "
         "5% of the fastest and whose bootstrap interval overlaps the fastest interval. "
         "The search candidate then faces independent paired validation. A candidate is "
-        "recommended only if validation shows at least the configured minimum improvement "
-        "and its 95% interval is above zero; otherwise the initial configuration is kept. "
-        "Interval overlap during search is a heuristic, not a formal test."
+        "recommended only if the observed median reaches the configured minimum and the "
+        "chosen validation policy is satisfied: by default the lower 95% bound must reach "
+        "the minimum; the positive policy requires only an interval strictly above zero."
     ),
     "validation": (
         "Validation uses fresh measurements, not search results. The initial and candidate "
@@ -49,30 +54,33 @@ METHOD = {
         "95% percentile bootstrap interval."
     ),
     "throughput_scope": (
-        "Data loading plus host-to-device tensor copies when the resolved device is "
-        "CUDA. No model forward or backward pass is executed."
+        "Loader mode measures data loading plus host-to-device tensor copies when the "
+        "resolved device is CUDA. Training mode measures the complete explicit forward, "
+        "loss, backward, and optimizer step around the loader, with CUDA synchronized only "
+        "at measurement boundaries."
     ),
 }
 
 LIMITATIONS = (
-    "Measurements describe data loading and, on CUDA, host-to-device copies. They "
-    "are not training throughput.",
+    "Loader throughput is not training throughput. Training throughput depends on the "
+    "user-supplied training_step_factory and cannot be generalized beyond that workload.",
+    "The training factory must create a fresh model, optimizer, and training environment "
+    "for each invocation. Reusing mutated model or optimizer state invalidates comparisons.",
     "max_ram_gb is a sampled system-memory guard, not a hard limit. Allocations can "
     "occur between samples, and unrelated processes affect the observed value.",
     "Balanced rounds and randomized order reduce simple ordering bias but do not remove "
     "operating-system caches, dataset caches, storage warm-up, CPU load drift, thermal "
     "effects, or memory retained between configurations.",
-    "Warmup rounds are discarded and measured rounds are reported separately. A new "
-    "loader is constructed for each pass, which keeps pass conditions comparable but does "
-    "not model every long-lived-worker usage pattern.",
-    "APDO does not reset dataset, sampler, transform, or global RNG state. Stateful or "
-    "random pipelines can process different samples in different rounds.",
+    "Warmup rounds are discarded and measured rounds are reported separately. A single "
+    "loader is reused within a trial across epochs; each trial still pays its own "
+    "construction and worker startup costs.",
+    "Supported generator, sampler, batch-sampler, and global RNG state are isolated per "
+    "trial. Undetected mutable state inside arbitrary datasets, transforms, collate "
+    "functions, worker_init_fn, or user factories can still reduce comparability.",
     "Confidence intervals reflect variation across rounds only. Validation intervals are "
     "paired percentile bootstrap intervals, not universal guarantees or formal proof.",
-    "Only map-style datasets with __len__ and __getitem__ are supported in v0.2.0.",
-    "Custom samplers, batch samplers, generators, collate functions, and worker_init_fn "
-    "objects are reused by reference. Their mutable state is shared with the original "
-    "loader and can change during benchmarking.",
+    "APDO supports standard map-style DataLoaders with finite samplers and an explicit "
+    "dataloader_factory contract for pipelines that need independent construction.",
     "Process RSS covers the parent process and is absolute, so it can include memory "
     "retained from earlier configurations. Worker memory is reflected only indirectly "
     "by system-wide memory availability. These memory observations are implemented "
@@ -98,6 +106,7 @@ class OptimizationResult:
     validation: ValidationResult
     round_orders: tuple[RoundOrder, ...] = ()
     loader_template: LoaderTemplate | None = None
+    loader_source: LoaderSource | None = None
     search_selected_config: LoaderConfig | None = None
     search_improvement_percent: float | None = None
     search_selection_reason: str | None = None
@@ -115,6 +124,8 @@ class OptimizationResult:
         return self.validation.candidate_config
 
     def build_dataloader(self) -> DataLoader:
+        if self.loader_source is not None and self.loader_source.factory is not None:
+            return self.loader_source.build(self.best_config, isolate=False)
         if self.loader_template is None:
             raise ValueError("this result does not contain a reconstructable loader template")
         return self.loader_template.build(self.best_config)
@@ -122,14 +133,15 @@ class OptimizationResult:
     def summary(self) -> str:
         measurement = self._measurement_for(self.best_config)
         summary = self.best_summary
-        passes = measurement.passes
-        batches = passes[0].batches if passes else 0
+        batches = self.epoch_batches()
         failed = sum(1 for item in self.measurements if not item.succeeded)
+        training = self.settings.benchmark_mode == "training"
         device_note = (
             "cuda (includes host-to-device copies)"
             if self.settings.device.startswith("cuda")
             else self.settings.device
         )
+        throughput_label = "training samples/s" if training else "samples/s"
         memory = _memory_text(summary)
         cold_start = _fmt_ms(measurement.cold_start_s)
         validation = self.validation
@@ -143,6 +155,7 @@ class OptimizationResult:
         lines = [
             "Recommended DataLoader configuration",
             f"  {self.best_config.describe()}",
+            f"  benchmark mode: {self.settings.benchmark_mode}; epochs: {self.settings.epochs}",
             "",
             "Recommendation validation",
             f"  status: {validation.status}",
@@ -152,9 +165,9 @@ class OptimizationResult:
             f"  decision: {validation.reason}",
             "",
             "Measured performance",
-            f"  median throughput: {summary.median_throughput:,.1f} samples/s",
+            f"  median throughput: {summary.median_throughput:,.1f} {throughput_label}",
             f"  throughput range: {summary.min_throughput:,.1f} - "
-            f"{summary.max_throughput:,.1f} samples/s",
+            f"{summary.max_throughput:,.1f} {throughput_label}",
             f"  median batch latency: {_fmt_ms(summary.median_latency_s)} "
             f"(p95 {_fmt_ms(summary.p95_latency_s)})",
             f"  startup to first batch: {_fmt_ms(summary.median_startup_s)} "
@@ -162,6 +175,18 @@ class OptimizationResult:
             f"  observed memory: {memory}",
             f"  {improvement}",
         ]
+        if summary.median_sustained_throughput is not None and self.settings.epochs > 1:
+            lines.append(
+                f"  sustained throughput: {summary.median_sustained_throughput:,.1f} "
+                f"{throughput_label}"
+            )
+        if training:
+            lines.append(
+                "  training step time: "
+                f"{_fmt_ms(summary.median_step_latency_s)} median; "
+                f"data wait {_fmt_ms(summary.median_data_wait_s)}; "
+                f"transfer {_fmt_ms(summary.median_transfer_s)}"
+            )
         if self.fastest_config != self.best_config:
             lines.append(f"  fastest measured configuration: {self.fastest_config.describe()}")
         if self.search_candidate_config != self.best_config:
@@ -173,10 +198,12 @@ class OptimizationResult:
                 "",
                 "Benchmark",
                 f"  {self.settings.rounds} measured search rounds, "
-                f"{self.settings.validation_rounds} validation rounds, "
-                f"{batches} batches per pass, {self.settings.dataset_size} dataset "
+                + (f"{self.settings.training_rounds} training rounds, " if training else "")
+                + f"{self.settings.validation_rounds} validation rounds, "
+                f"{batches} batches per epoch, {self.settings.dataset_size} dataset "
                 f"samples, batch_size={self._batch_size_text()}",
-                f"  seed: {self.settings.seed}; input: {self.settings.input_kind}",
+                f"  seed: {self.settings.seed}; input: {self.settings.input_kind}; "
+                f"reproducibility: {self.settings.reproducibility_status}",
                 f"  device: {device_note}",
                 f"  {len(self.measurements)} search configurations measured ({failed} failed)",
                 "",
@@ -198,12 +225,15 @@ class OptimizationResult:
         fastest_summary = fastest.summary_or_raise()
         final_measurement = self._measurement_for(self.best_config)
         final_summary = final_measurement.summary_or_raise()
-        baseline_measurement = self._search_measurement_for(
+        loader_baseline = self._search_measurement_for(
             self.settings.initial_config,
             required=False,
+            training=False,
         )
-        baseline_summary = (
-            baseline_measurement.summary if baseline_measurement is not None else None
+        training_baseline = self._search_measurement_for(
+            self.settings.initial_config,
+            required=False,
+            training=True,
         )
 
         configurations = []
@@ -237,10 +267,13 @@ class OptimizationResult:
         baseline_payload: dict[str, Any] = {
             "config": self.settings.initial_config.to_dict(),
         }
-        if baseline_summary is not None:
-            baseline_payload["search_summary"] = baseline_summary.to_dict()
+        if loader_baseline is not None and loader_baseline.summary is not None:
+            baseline_payload["search_summary"] = loader_baseline.summary.to_dict()
+        if training_baseline is not None and training_baseline.summary is not None:
+            baseline_payload["training_summary"] = training_baseline.summary.to_dict()
+            baseline_payload["training_config"] = training_baseline.config.to_dict()
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "apdo_version": self.version,
             "started_at_utc": self.started_at.isoformat(),
             "duration_s": self.duration_s,
@@ -251,12 +284,19 @@ class OptimizationResult:
                 "validation_rounds": self.settings.validation_rounds,
                 "min_improvement": self.settings.min_improvement,
                 "validation_enabled": self.settings.validation_enabled,
+                "validation_policy": self.settings.validation_policy,
+                "training_rounds": self.settings.training_rounds,
+                "training_validation_rounds": self.settings.training_validation_rounds,
+                "max_training_candidates": self.settings.max_training_candidates,
                 "time_budget_s": self.settings.time_budget_s,
                 "budget_exhausted": self.budget_exhausted,
                 "measured_orders": measured_orders,
                 "warmup_orders": warmup_orders,
             },
+            "benchmark_mode": self.settings.benchmark_mode,
+            "epochs": self.settings.epochs,
             "environment": self.environment.to_dict(),
+            "reproducibility": self._reproducibility_details(),
             "settings": self.settings.to_dict(),
             "loader": self._loader_details(),
             "method": dict(METHOD),
@@ -270,11 +310,23 @@ class OptimizationResult:
                 "median_throughput": self._search_measurement_for(self.search_candidate_config)
                 .summary_or_raise()
                 .median_throughput,
+                "throughput_kind": (
+                    "end_to_end_training"
+                    if self.settings.benchmark_mode == "training"
+                    else "loader"
+                ),
+                "epochs": self.settings.epochs,
             },
+            "training": self._training_details(),
             "validation": self.validation.to_dict(),
             "recommended": {
                 "config": self.best_config.to_dict(),
                 "median_throughput": final_summary.median_throughput,
+                "throughput_kind": (
+                    "end_to_end_training"
+                    if self.settings.benchmark_mode == "training"
+                    else "loader"
+                ),
                 "improvement_percent": self.improvement_percent,
                 "validation_status": self.validation.status,
                 "selection_reason": self.selection_reason,
@@ -282,6 +334,11 @@ class OptimizationResult:
             "fastest": {
                 "config": self.fastest_config.to_dict(),
                 "median_throughput": fastest_summary.median_throughput,
+                "throughput_kind": (
+                    "end_to_end_training"
+                    if self.settings.benchmark_mode == "training"
+                    else "loader"
+                ),
             },
             "configurations": configurations,
             "failures": failures,
@@ -315,20 +372,35 @@ class OptimizationResult:
         config: LoaderConfig,
         *,
         required: bool = True,
+        training: bool | None = None,
     ) -> ConfigMeasurement | None:
-        for measurement in self.measurements:
+        expected_training = (
+            self.settings.benchmark_mode == "training" if training is None else training
+        )
+        matches = [
+            measurement
+            for measurement in self.measurements
             if (
                 measurement.succeeded
                 and measurement.config == config
                 and measurement.summary is not None
-            ):
-                return measurement
+                and measurement.training == expected_training
+            )
+        ]
+        if matches:
+            return max(matches, key=lambda item: item.summary.median_throughput)
         if required:
-            raise ValueError(f"no completed search measurement for {config.describe()}")
+            phase = "training " if expected_training else ""
+            raise ValueError(f"no completed {phase}measurement for {config.describe()}")
         return None
 
     def _ranked_successes(self) -> list[ConfigMeasurement]:
-        ranked = [item for item in self.measurements if item.succeeded and item.summary is not None]
+        training = self.settings.benchmark_mode == "training"
+        ranked = [
+            item
+            for item in self.measurements
+            if item.succeeded and item.summary is not None and item.training == training
+        ]
         ranked.sort(
             key=lambda item: item.summary.median_throughput if item.summary else 0.0,
             reverse=True,
@@ -341,6 +413,8 @@ class OptimizationResult:
         best_measurement = self._measurement_for(self.best_config)
         failed = [item for item in self.measurements if not item.succeeded]
         device_is_cuda = self.settings.device.startswith("cuda")
+        training = self.settings.benchmark_mode == "training"
+        throughput_label = "training samples/s" if training else "samples/s"
         fastest_note = ""
         if self.fastest_config != self.best_config:
             fastest_note = (
@@ -349,13 +423,31 @@ class OptimizationResult:
             )
 
         metric_cards = [
-            ("Median throughput", f"{best.median_throughput:,.1f} samples/s"),
+            (
+                "Median training throughput" if training else "Median throughput",
+                f"{best.median_throughput:,.1f} {throughput_label}",
+            ),
             ("Median batch latency", _fmt_ms(best.median_latency_s)),
             ("p95 batch latency", _fmt_ms(best.p95_latency_s)),
             ("Median startup", _fmt_ms(best.median_startup_s)),
             ("Cold start", _fmt_ms(best_measurement.cold_start_s)),
             ("Observed memory", _memory_text(best)),
         ]
+        if training:
+            metric_cards.extend(
+                [
+                    ("Median step time", _fmt_ms(best.median_step_latency_s)),
+                    ("Median data wait", _fmt_ms(best.median_data_wait_s)),
+                    ("Median transfer", _fmt_ms(best.median_transfer_s)),
+                ]
+            )
+        if self.settings.epochs > 1:
+            metric_cards.append(
+                (
+                    "Sustained throughput",
+                    f"{_fmt_optional_throughput(best.median_sustained_throughput)}",
+                )
+            )
         cards_html = "\n".join(
             f'<div class="metric"><span>{escape(label)}</span>'
             f"<strong>{escape(value)}</strong></div>"
@@ -368,6 +460,9 @@ class OptimizationResult:
             items = "\n".join(f"<li>{escape(item)}</li>" for item in self.warnings)
             warnings_html = f"<section><h2>Warnings</h2><ul>{items}</ul></section>"
 
+        cycles_html = self._cycles_html()
+        training_html = self._training_html()
+        reproducibility_html = self._reproducibility_html()
         rows = []
         for rank, measurement in enumerate(self._ranked_successes(), start=1):
             summary = measurement.summary
@@ -445,6 +540,8 @@ class OptimizationResult:
         loader_details = self._loader_details()
         settings_rows = [
             ("Protocol", self.settings.protocol_version),
+            ("Mode", self.settings.benchmark_mode),
+            ("Epochs", str(self.settings.epochs)),
             ("Input", self.settings.input_kind),
             ("Loader dataset", loader_details["dataset"] if loader_details else "n/a"),
             ("Loader sampler", loader_details["sampler"] if loader_details else "n/a"),
@@ -462,8 +559,12 @@ class OptimizationResult:
             ("Batch size", self._batch_size_text()),
             ("Batches per pass", str(self.best_measurement_batches())),
             ("Search rounds", str(self.settings.rounds)),
+            ("Training rounds", str(self.settings.training_rounds)),
+            ("Training validation rounds", str(self.settings.training_validation_rounds)),
             ("Validation rounds", str(self.settings.validation_rounds)),
             ("Warmup rounds", str(self.settings.warmup_runs)),
+            ("Validation policy", self.settings.validation_policy),
+            ("Reproducibility", self.settings.reproducibility_status),
             (
                 "Minimum improvement",
                 f"{self.settings.min_improvement * 100:.1f}%",
@@ -511,7 +612,9 @@ class OptimizationResult:
 <p class="eyebrow">apdo {escape(self.version)}</p>
 <h1>PyTorch DataLoader benchmark report</h1>
 <p class="muted">Started {escape(self.started_at.isoformat())} &middot;
-completed in {self.duration_s:.2f} s</p>
+completed in {self.duration_s:.2f} s &middot;
+mode {escape(self.settings.benchmark_mode)} &middot;
+{self.settings.epochs} epoch(s)</p>
 </header>
 
 <section class="card accent">
@@ -523,6 +626,10 @@ completed in {self.duration_s:.2f} s</p>
 </section>
 
 {validation_html}
+
+{training_html}
+
+{reproducibility_html}
 
 {warnings_html}
 
@@ -540,6 +647,8 @@ completed in {self.duration_s:.2f} s</p>
 </section>
 
 {order_html}
+
+{cycles_html}
 
 {failures_html}
 
@@ -565,7 +674,8 @@ completed in {self.duration_s:.2f} s</p>
 
 <footer>
 Generated locally by apdo {escape(self.version)}. This report is self-contained and
-requires no network access. Throughput covers data loading, not model training.
+requires no network access. Throughput is {escape(throughput_label)} in
+{escape(self.settings.benchmark_mode)} mode.
 </footer>
 </main>
 </body>
@@ -590,13 +700,16 @@ requires no network access. Throughput covers data loading, not model training.
     def _validation_html(self) -> str:
         escape = html.escape
         validation = self.validation
+        throughput_label = (
+            "training samples/s" if self.settings.benchmark_mode == "training" else "samples/s"
+        )
         baseline_median = (
-            f"{validation.baseline_summary.median_throughput:,.1f} samples/s"
+            f"{validation.baseline_summary.median_throughput:,.1f} {throughput_label}"
             if validation.baseline_summary is not None
             else "n/a"
         )
         candidate_median = (
-            f"{validation.candidate_summary.median_throughput:,.1f} samples/s"
+            f"{validation.candidate_summary.median_throughput:,.1f} {throughput_label}"
             if validation.candidate_summary is not None
             else "n/a"
         )
@@ -612,7 +725,8 @@ requires no network access. Throughput covers data loading, not model training.
         if rows:
             observations_html = (
                 '<div class="table-wrap"><table><thead><tr>'
-                "<th>Round</th><th>Baseline samples/s</th><th>Candidate samples/s</th>"
+                f"<th>Round</th><th>Baseline {escape(throughput_label)}</th>"
+                f"<th>Candidate {escape(throughput_label)}</th>"
                 "<th>Paired gain</th></tr></thead><tbody>"
                 + "".join(rows)
                 + "</tbody></table></div>"
@@ -646,8 +760,11 @@ requires no network access. Throughput covers data loading, not model training.
 <div class="metric"><span>95% interval</span>
 <strong>{escape(_fmt_interval(validation))}</strong></div>
 </div>
+<p><strong>Validation policy:</strong> {escape(validation.policy)}</p>
 <p><strong>Minimum practical gain:</strong>
 {validation.min_improvement_percent:.1f}%</p>
+<p><strong>Threshold guaranteed:</strong>
+{"yes" if validation.threshold_guaranteed else "no"}</p>
 <p><strong>Decision:</strong> {escape(validation.reason)}</p>
 <p><strong>Final recommendation:</strong>
 <code>{escape(self.best_config.describe())}</code></p>
@@ -655,6 +772,83 @@ requires no network access. Throughput covers data loading, not model training.
 {observations_html}
 {failures_html}
 </section>"""
+
+    def _training_html(self) -> str:
+        details = self._training_details()
+        if details is None:
+            return ""
+        escape = html.escape
+        baseline_summary = details["baseline"]["summary"]
+        selected_summary = details["selected"]["summary"]
+        return f"""<section class="card validation">
+<p class="eyebrow">End-to-End Training</p>
+<div class="metrics">
+<div class="metric"><span>Initial training config</span>
+<strong><code>{escape(self.settings.initial_config.describe())}</code></strong></div>
+<div class="metric"><span>Training-selected config</span>
+<strong><code>{escape(self.search_candidate_config.describe())}</code></strong></div>
+<div class="metric"><span>Initial training throughput</span>
+<strong>{baseline_summary["median_throughput"]:,.1f} training samples/s</strong></div>
+<div class="metric"><span>Selected training throughput</span>
+<strong>{selected_summary["median_throughput"]:,.1f} training samples/s</strong></div>
+<div class="metric"><span>Epochs per trial</span>
+<strong>{details["epochs"]}</strong></div>
+<div class="metric"><span>Training rounds</span>
+<strong>{details["rounds"]}</strong></div>
+<div class="metric"><span>Median step time</span>
+<strong>{_fmt_ms(details["median_step_latency_s"])}</strong></div>
+<div class="metric"><span>Median data wait</span>
+<strong>{_fmt_ms(details["median_data_wait_s"])}</strong></div>
+<div class="metric"><span>Median transfer</span>
+<strong>{_fmt_ms(details["median_transfer_s"])}</strong></div>
+</div>
+<p class="muted">Training throughput includes the explicit user-supplied forward,
+loss, backward, and optimizer step around the DataLoader.</p>
+</section>"""
+
+    def _reproducibility_html(self) -> str:
+        details = self._reproducibility_details()
+        escape = html.escape
+        risks = details.get("risks") or []
+        risks_html = ""
+        if risks:
+            items = "".join(f"<li>{escape(item)}</li>" for item in risks)
+            risks_html = f"<h3>Detected risks</h3><ul>{items}</ul>"
+        managed = details.get("managed") or []
+        managed_text = ", ".join(managed) if managed else "none"
+        return f"""<section>
+<h2>Reproducibility</h2>
+<div class="table-wrap"><table class="kv"><tbody>
+<tr><th>Status</th><td><code>{escape(str(details.get("status", "unknown")))}</code></td></tr>
+<tr><th>Managed state</th><td>{escape(managed_text)}</td></tr>
+<tr><th>Training allowed</th><td>{details.get("training_allowed")}</td></tr>
+</tbody></table></div>
+<p>{escape(str(details.get("reason", "")))}</p>
+{risks_html}
+</section>"""
+
+    def _cycles_html(self) -> str:
+        rows: list[str] = []
+        measurement = self._measurement_for(self.best_config)
+        for pass_index, metrics in enumerate(measurement.passes, start=1):
+            for cycle in metrics.cycles:
+                rows.append(
+                    f"<tr><td>{pass_index}</td><td>{cycle.cycle_index + 1}</td>"
+                    f"<td>{cycle.batches}</td><td>{cycle.samples}</td>"
+                    f"<td>{cycle.throughput:,.1f}</td>"
+                    f"<td>{_fmt_ms(cycle.startup_s)}</td>"
+                    f"<td>{_fmt_ms(cycle.data_wait_s)}</td>"
+                    f"<td>{_fmt_ms(cycle.transfer_s)}</td></tr>"
+                )
+        if not rows:
+            return ""
+        return (
+            "<section><h2>Epoch measurements</h2>"
+            '<div class="table-wrap"><table><thead><tr>'
+            "<th>Round</th><th>Epoch</th><th>Batches</th><th>Samples</th>"
+            "<th>Samples/s</th><th>Startup</th><th>Data wait</th><th>Transfer</th>"
+            "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div></section>"
+        )
 
     def _order_html(self) -> str:
         escape = html.escape
@@ -679,8 +873,61 @@ requires no network access. Throughput covers data loading, not model training.
         )
 
     def best_measurement_batches(self) -> int:
+        return self.epoch_batches()
+
+    def epoch_batches(self) -> int:
         measurement = self._measurement_for(self.best_config)
-        return measurement.passes[0].batches if measurement.passes else 0
+        passes = measurement.passes
+        if not passes:
+            return 0
+        if passes[0].cycles:
+            return passes[0].cycles[0].batches
+        return passes[0].batches
+
+    def _reproducibility_details(self) -> dict[str, Any]:
+        if self.loader_source is None:
+            return {
+                "status": self.settings.reproducibility_status,
+                "managed": [],
+                "risks": [],
+                "reason": "No loader source metadata is attached to this result.",
+                "training_allowed": self.settings.reproducibility_status
+                in {"verified", "factory_managed"},
+            }
+        return self.loader_source.isolation.to_dict()
+
+    def _training_details(self) -> dict[str, Any] | None:
+        if self.settings.benchmark_mode != "training":
+            return None
+        baseline = self._search_measurement_for(
+            self.settings.initial_config,
+            required=False,
+            training=True,
+        )
+        selected = self._search_measurement_for(
+            self.search_candidate_config,
+            required=False,
+            training=True,
+        )
+        if baseline is None or selected is None:
+            return None
+        return {
+            "epochs": self.settings.epochs,
+            "rounds": self.settings.training_rounds,
+            "validation_rounds": self.settings.training_validation_rounds,
+            "baseline": {
+                "config": baseline.config.to_dict(),
+                "summary": baseline.summary_or_raise().to_dict(),
+            },
+            "selected": {
+                "config": selected.config.to_dict(),
+                "summary": selected.summary_or_raise().to_dict(),
+            },
+            "median_data_wait_s": selected.summary_or_raise().median_data_wait_s,
+            "median_step_latency_s": selected.summary_or_raise().median_step_latency_s,
+            "median_transfer_s": selected.summary_or_raise().median_transfer_s,
+            "total_transfer_bytes": selected.summary_or_raise().total_transfer_bytes,
+        }
 
     def _batch_size_text(self) -> str:
         if self.loader_template is not None and self.loader_template.unbatched:
@@ -691,6 +938,8 @@ requires no network access. Throughput covers data loading, not model training.
 
     def _loader_details(self) -> dict[str, Any] | None:
         template = self.loader_template
+        if template is None and self.loader_source is not None:
+            template = self.loader_source.template
         if template is None:
             return None
         return {
@@ -854,6 +1103,10 @@ def _fmt_mib(value: int | None) -> str:
     if value is None:
         return "n/a"
     return f"{value / (1024**2):,.1f} MiB"
+
+
+def _fmt_optional_throughput(value: float | None) -> str:
+    return f"{value:,.1f} samples/s" if value is not None else "n/a"
 
 
 def _fmt_percent(value: float | None) -> str:

@@ -5,6 +5,7 @@ import math
 import pytest
 
 from apdo.metrics import (
+    CycleMetrics,
     PassMetrics,
     bootstrap_median_ci,
     mean,
@@ -107,3 +108,62 @@ def test_pass_serialization() -> None:
     assert data["batches"] == 4
     assert data["median_latency_s"] == 0.02
     assert data["p95_latency_s"] == pytest.approx(0.029)
+
+
+def test_cycle_summary_uses_sustained_and_training_signals() -> None:
+    cycle_one = CycleMetrics(
+        cycle_index=0,
+        startup_s=0.10,
+        duration_s=2.0,
+        batches=4,
+        samples=100,
+        throughput=50.0,
+        steady_elapsed_s=1.5,
+        steady_samples=75,
+        steady_throughput=50.0,
+        latencies_s=(0.1, 0.1, 0.1),
+        step_latencies_s=(0.01, 0.02),
+    )
+    cycle_two = CycleMetrics(
+        cycle_index=1,
+        startup_s=0.05,
+        duration_s=0.5,
+        batches=4,
+        samples=100,
+        throughput=200.0,
+        steady_elapsed_s=0.5,
+        steady_samples=100,
+        steady_throughput=200.0,
+        latencies_s=(0.1, 0.1, 0.1),
+        step_latencies_s=(0.03, 0.04),
+    )
+    pass_metrics = PassMetrics(
+        startup_s=0.10,
+        steady_elapsed_s=0.5,
+        batches=8,
+        steady_samples=100,
+        throughput=200.0,
+        latencies_s=(0.1, 0.1, 0.1, 0.1, 0.1, 0.1),
+        sustained_throughput=200.0,
+        cycles=(cycle_one, cycle_two),
+        training=True,
+        data_wait_s=0.07,
+        transfer_s=0.03,
+        transfer_bytes=64,
+        worker_startup_overhead_s=0.05,
+        average_epoch_transition_s=0.05,
+    )
+
+    summary = summarize_passes([pass_metrics])
+    payload = pass_metrics.to_dict()
+
+    assert summary.median_first_cycle_throughput == 50.0
+    assert summary.median_subsequent_cycle_throughput == 200.0
+    assert summary.median_worker_startup_overhead_s == 0.05
+    assert summary.median_epoch_transition_s == 0.05
+    assert summary.median_step_latency_s == 0.025
+    assert summary.median_data_wait_s == 0.07
+    assert summary.total_transfer_bytes == 64
+    assert payload["training"] is True
+    assert payload["median_step_latency_s"] == 0.025
+    assert len(payload["cycles"]) == 2
