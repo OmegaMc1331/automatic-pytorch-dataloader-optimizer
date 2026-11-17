@@ -125,7 +125,7 @@ def make_settings(
         time_budget_s=None,
         initial_config=initial_config or LoaderConfig(),
         input_kind="dataset",
-        protocol_version="2.0",
+        protocol_version="3.0",
         expected_batches=8,
     )
 

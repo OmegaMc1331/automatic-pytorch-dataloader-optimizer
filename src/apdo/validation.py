@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from apdo.config import LoaderConfig
+from apdo.config import VALIDATION_POLICIES, LoaderConfig
 from apdo.metrics import MetricsSummary, PassMetrics, bootstrap_median_ci, median, summarize_passes
 from apdo.order import derive_seed
 
@@ -55,10 +55,17 @@ class ValidationResult:
     failures: tuple[str, ...]
     reason: str
     enabled: bool
+    policy: str = "minimum"
 
     @property
     def confirmed(self) -> bool:
         return self.status == "confirmed"
+
+    @property
+    def threshold_guaranteed(self) -> bool:
+        return (
+            self.ci_low_percent is not None and self.ci_low_percent >= self.min_improvement_percent
+        )
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -71,6 +78,8 @@ class ValidationResult:
             "ci_high_percent": self.ci_high_percent,
             "min_improvement_percent": self.min_improvement_percent,
             "reason": self.reason,
+            "policy": self.policy,
+            "threshold_guaranteed": self.threshold_guaranteed,
             "observations": [observation.to_dict() for observation in self.observations],
             "failures": list(self.failures),
         }
@@ -90,12 +99,15 @@ def analyze_validation(
     min_improvement: float,
     seed: int,
     failures: Sequence[str] = (),
+    policy: str = "minimum",
 ) -> ValidationResult:
     baseline_passes = [item.baseline for item in observations]
     candidate_passes = [item.candidate for item in observations]
     baseline_summary = summarize_passes(baseline_passes) if baseline_passes else None
     candidate_summary = summarize_passes(candidate_passes) if candidate_passes else None
     min_percent = min_improvement * 100.0
+    if policy not in VALIDATION_POLICIES:
+        raise ValueError(f"unknown validation policy {policy!r}")
 
     if candidate_config == baseline_config:
         return _result(
@@ -115,6 +127,7 @@ def analyze_validation(
                 "validation was not required."
             ),
             enabled=enabled,
+            policy=policy,
         )
 
     if not enabled:
@@ -135,6 +148,7 @@ def analyze_validation(
                 "retained because the search result is unconfirmed."
             ),
             enabled=enabled,
+            policy=policy,
         )
 
     if len(observations) < MIN_VALIDATION_PAIRS:
@@ -156,6 +170,7 @@ def analyze_validation(
                 "candidate and the initial configuration." + detail
             ),
             enabled=enabled,
+            policy=policy,
         )
 
     gains = [item.gain for item in observations]
@@ -178,22 +193,34 @@ def analyze_validation(
             f"{ci_high_percent:+.1f}%]. The candidate was not faster, so the initial "
             "configuration is retained."
         )
-    elif observed >= min_improvement and ci_low > 0.0:
+    elif _confirmation_met(observed, ci_low, min_improvement, policy):
         status = "confirmed"
+        if policy == "minimum":
+            guarantee = (
+                f"the lower 95% bound reaches the {min_percent:.1f}% minimum improvement threshold"
+            )
+        else:
+            guarantee = "the interval is strictly above zero"
         reason = (
             f"Validation observed a median candidate improvement of "
             f"{observed_percent:+.1f}% with a 95% paired bootstrap interval of "
             f"[{ci_low_percent:+.1f}%, {ci_high_percent:+.1f}%]. The observed gain "
-            f"meets the {min_percent:.1f}% minimum and the interval is above zero."
+            f"meets the {min_percent:.1f}% minimum and {guarantee}."
         )
     else:
         status = "inconclusive"
+        if policy == "minimum":
+            requirement = (
+                f"the lower 95% bound does not reach the {min_percent:.1f}% minimum "
+                "improvement threshold"
+            )
+        else:
+            requirement = "the interval is not strictly above zero"
         reason = (
             f"Validation observed a median candidate change of {observed_percent:+.1f}% "
             f"with a 95% paired bootstrap interval of [{ci_low_percent:+.1f}%, "
-            f"{ci_high_percent:+.1f}%]. This does not establish the required "
-            f"{min_percent:.1f}% gain with the interval above zero, so the initial "
-            "configuration is retained."
+            f"{ci_high_percent:+.1f}%]. {requirement[0].upper() + requirement[1:]}, "
+            "so the initial configuration is retained."
         )
 
     return _result(
@@ -210,7 +237,21 @@ def analyze_validation(
         failures=failures,
         reason=reason,
         enabled=enabled,
+        policy=policy,
     )
+
+
+def _confirmation_met(
+    observed: float,
+    ci_low: float,
+    min_improvement: float,
+    policy: str,
+) -> bool:
+    if observed < min_improvement:
+        return False
+    if policy == "minimum":
+        return ci_low >= min_improvement
+    return ci_low > 0.0
 
 
 def final_configuration(
@@ -235,9 +276,12 @@ def _result(
     failures: Sequence[str],
     reason: str,
     enabled: bool,
+    policy: str,
 ) -> ValidationResult:
     if status not in VALIDATION_STATUSES:
         raise ValueError(f"unknown validation status {status!r}")
+    if policy not in VALIDATION_POLICIES:
+        raise ValueError(f"unknown validation policy {policy!r}")
     return ValidationResult(
         status=status,
         baseline_config=baseline_config,
@@ -252,4 +296,5 @@ def _result(
         failures=tuple(failures),
         reason=reason,
         enabled=enabled,
+        policy=policy,
     )

@@ -6,6 +6,8 @@
 
 `apdo` measures `torch.utils.data.DataLoader` configurations on the machine where it runs and recommends a setting for `num_workers`, `pin_memory`, `prefetch_factor`, and `persistent_workers`.
 
+In loader mode it reports sustained data-loading throughput. In training mode it runs the user's forward, backward, and optimizer step and recommends the loader that delivers the highest end-to-end training throughput.
+
 The package name is `apdo`. The command-line interface is also `apdo`.
 
 ## Why APDO
@@ -14,25 +16,28 @@ DataLoader throughput depends on the dataset, storage, preprocessing cost, CPU t
 
 APDO runs the real loader, records repeated measurements, validates the search recommendation with fresh measurements, and retains the initial configuration when a gain is not confirmed. It does not estimate performance from hardware specifications and does not call a cloud service.
 
-## Features in v0.2.0
+## Features in v0.3.0
 
-- Optimizes an existing map-style dataset with a batch size, or an existing `DataLoader`.
+- Optimizes a map-style dataset with a batch size, an existing `DataLoader`, or a config-aware loader factory.
+- Measures repeated epochs in one trial and reports worker startup, epoch transitions, steady-state throughput, and full or partial epochs separately.
+- Supports end-to-end training mode with a user-supplied training-step factory covering forward, backward, and optimizer work.
 - Preserves the original loader's dataset, batch size, sampler, batch sampler, collate function, `drop_last`, timeout, worker initialization, generator, multiprocessing context, and `in_order` setting.
 - Changes only `num_workers`, `pin_memory`, `prefetch_factor`, and `persistent_workers`.
+- Isolates supported loader generators and samplers, restores Python/Torch/NumPy/CUDA RNG state after each trial, and reports a reproducibility status.
 - Runs seeded, balanced rounds and records the executed configuration order and every per-round measurement.
-- Runs independent paired validation instead of treating the search result as proof.
-- Returns `confirmed`, `inconclusive`, `regression`, `not_needed`, or `not_possible` validation outcomes.
+- Reports worker PIDs, process RSS, data-wait time, host-to-device transfer time, training-step latency, and epoch-transition overhead.
+- Runs independent paired validation with a configurable `minimum` or `positive` policy instead of treating the search result as proof.
 - Falls back to the initial configuration unless validation confirms the required minimum gain.
 - Supports optional time budgets and custom sample counting for unusual collate functions.
-- Generates a schema-v2 JSON report and a self-contained HTML report with validation, ranking, execution order, environment, method, and limitations.
-- Provides three deterministic local workloads for serious tuning runs without adding slow benchmarks to CI.
+- Generates a schema-v3 JSON report and a self-contained HTML report with cycles, training metrics, reproducibility, validation, ranking, execution order, environment, method, and limitations.
+- Provides four deterministic local workloads, including a real training workload, without adding slow benchmarks to CI.
 
 ## Installation
 
-v0.2.0 is distributed through GitHub Releases. PyPI publication is not part of this release.
+v0.3.0 is distributed through GitHub Releases. PyPI publication is not part of this release.
 
 ```bash
-pip install "git+https://github.com/OmegaMc1331/automatic-pytorch-dataloader-optimizer.git@v0.2.0"
+pip install "git+https://github.com/OmegaMc1331/automatic-pytorch-dataloader-optimizer.git@v0.3.0"
 ```
 
 For development from a clone:
@@ -102,7 +107,7 @@ print(result.best_config.describe())
 optimized_loader = result.build_dataloader()
 ```
 
-The original loader is not modified. APDO keeps the existing batch size and the loader behavior outside the four optimized options. A custom sampler, batch sampler, generator, or `worker_init_fn` is reused by reference, so mutable state can be shared with the original loader; the result includes a warning in that case.
+The original loader is not modified. APDO keeps the existing batch size and the loader behavior outside the four optimized options. A standard generator, sampler, and batch sampler are reconstructed for each trial. If a custom sampler or batch sampler cannot be reconstructed safely, APDO marks reproducibility as not guaranteed and refuses training mode.
 
 `optimize` also accepts the loader as its first positional argument:
 
@@ -111,6 +116,84 @@ result = optimize(original_loader, device="cpu")
 ```
 
 Dataset and loader inputs are mutually exclusive. A `batch_size` override is rejected for a loader with an existing batch size. `DataLoader` subclasses are rejected because APDO cannot verify that their behavior is preserved.
+
+## Python quick start: end-to-end training
+
+Training mode is explicit. APDO never starts model training unless `mode="training"` and a `training_step_factory` are provided.
+
+```python
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
+
+from apdo import optimize
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+dataset = TensorDataset(torch.randn(2048, 32), torch.randint(0, 10, (2048,)))
+
+
+def create_training_step():
+    model = nn.Sequential(nn.Linear(32, 128), nn.ReLU(), nn.Linear(128, 10)).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    loss_fn = nn.CrossEntropyLoss()
+
+    def step(batch):
+        features, labels = batch
+        features = features.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        loss = loss_fn(model(features), labels)
+        loss.backward()
+        optimizer.step()
+
+    return step
+
+
+result = optimize(
+    dataset,
+    batch_size=64,
+    device=device,
+    mode="training",
+    epochs=3,
+    training_step_factory=create_training_step,
+    rounds=3,
+    training_rounds=2,
+    validation_rounds=5,
+)
+print(result.to_dict()["training"])
+print(result.best_config.describe())
+```
+
+The factory takes no arguments and is called once per measured trial. It must create a fresh model, optimizer, and any other mutable training state on each call. APDO transfers supported batch tensor structures to the resolved device before calling the returned `step(batch)`. Training mode is refused when the loader or dataset cannot be isolated sufficiently for comparable trials.
+
+## Config-aware loader factory
+
+Use a loader factory when loader or dataset state must be created fresh for every trial:
+
+```python
+from torch.utils.data import DataLoader
+
+from apdo import LoaderConfig, optimize
+
+
+def build_loader(config: LoaderConfig) -> DataLoader:
+    return DataLoader(
+        dataset,
+        batch_size=64,
+        shuffle=True,
+        **config.to_dataloader_kwargs(),
+    )
+
+
+result = optimize(
+    dataloader_factory=build_loader,
+    device="auto",
+    mode="training",
+    training_step_factory=create_training_step,
+)
+```
+
+The factory must return a standard `DataLoader` that honors the requested `LoaderConfig`. The initial configuration is `LoaderConfig()`. Factory-managed state cannot be inspected by APDO, so the result reports reproducibility status `factory_managed`.
 
 ### Preserved loader options
 
@@ -133,21 +216,27 @@ Only `num_workers`, `pin_memory`, `prefetch_factor`, and `persistent_workers` va
 
 ## How the recommendation is produced
 
-1. A map-style dataset or loader is validated. The initial loader configuration becomes the safe fallback baseline.
-2. Stage 1 scans `num_workers` values with default prefetch settings and applicable `pin_memory` choices.
-3. Stage 2 varies `prefetch_factor` and `persistent_workers` for the two best multi-worker counts.
-4. Configurations are measured in seeded, balanced rounds. A discarded warmup round is followed by one measured pass per configuration per round. The executed order is recorded.
-5. The search selects the simplest configuration that is within 5% of the fastest median throughput and whose bootstrap interval overlaps the fastest interval.
-6. The initial and search-candidate configurations are measured again in balanced paired rounds. Search measurements are not reused.
-7. A paired bootstrap interval of relative gains determines the validation status.
-8. The candidate is recommended only when the observed median gain meets `min_improvement` and the 95% interval is above zero. Otherwise the initial configuration is retained.
-9. Validation that is stopped by the time budget before all planned rounds complete cannot confirm the candidate; the initial configuration is retained.
+1. A map-style dataset, loader, or config-aware factory is validated. The initial loader configuration becomes the safe fallback baseline.
+2. Loader search stage 1 scans `num_workers` values with default prefetch settings and applicable `pin_memory` choices.
+3. Loader search stage 2 varies `prefetch_factor` and `persistent_workers` for the two best multi-worker counts.
+4. In training mode, stage 1 and stage 2 measure data loading with one epoch. The initial configuration, the fastest loader configuration, and the highest-ranked alternatives then run the user's training step for the requested number of epochs.
+5. Configurations are measured in seeded, balanced rounds. A discarded warmup round is followed by one measured pass per configuration per round. The executed order is recorded.
+6. Multi-epoch passes warm the first epoch and report sustained throughput from later epochs. Single-epoch loader mode preserves the legacy steady-state calculation. Throughput excludes worker teardown, just as it excludes startup before the first batch.
+7. Training mode ranks candidates by sustained end-to-end training throughput. The search recommendation is not based on loader-only throughput.
+8. The initial and selected configurations are measured again in balanced paired rounds. Search measurements are not reused.
+9. A paired bootstrap interval of relative gains determines the validation status under the selected policy.
+10. Validation that is stopped by the time budget before all planned rounds complete cannot confirm the candidate; the initial configuration is retained.
+
+### Validation policies
+
+- `minimum` requires the observed median gain and the lower 95% interval bound to reach `min_improvement`. This is the default and guarantees the configured threshold at the lower interval bound.
+- `positive` requires the observed median gain to reach `min_improvement` and the interval to be strictly above zero. It allows a statistically positive gain that may not guarantee the full threshold.
 
 ### Validation statuses
 
 | Status | Meaning |
 | --- | --- |
-| `confirmed` | The candidate met the minimum gain and the paired interval is above zero. |
+| `confirmed` | The candidate met the selected policy. |
 | `inconclusive` | The candidate did not establish the required gain. The initial configuration is retained. |
 | `regression` | The candidate was slower in validation. The initial configuration is retained. |
 | `not_needed` | The search selected the initial configuration. |
@@ -160,12 +249,21 @@ Only `num_workers`, `pin_memory`, `prefetch_factor`, and `persistent_workers` va
 | `dataset` | `None` | Map-style dataset or existing `DataLoader`. |
 | `batch_size` | `32` for datasets | Required for dataset input; must match an existing loader if provided. |
 | `device` | `"auto"` | `"auto"`, `"cpu"`, `"cuda"`, or `"cuda:N"`. |
+| `dataloader` | `None` | Existing loader; mutually exclusive with `dataset` and `dataloader_factory`. |
+| `dataloader_factory` | `None` | Callable taking `LoaderConfig` and returning a standard `DataLoader`. |
+| `mode` | `"loader"` | `"loader"` or `"training"`. |
+| `epochs` | `1` loader, `3` training | Epochs per measured trial; at most 20. |
+| `training_step_factory` | `None` | Zero-argument callable returning a fresh `step(batch)` for training mode. |
+| `training_rounds` | `2` | Measured balanced rounds for training finalists. |
+| `training_validation_rounds` | `validation_rounds` | Paired validation rounds in training mode. |
+| `max_training_candidates` | `3` | Maximum configurations promoted to the training stage. |
+| `validation_policy` | `"minimum"` | `"minimum"` or `"positive"`. |
 | `warmup_runs` | `1` | Discarded warmup rounds per configuration. Must be at least 1. |
 | `repetitions` | `3` | Legacy number of measured search rounds. |
 | `rounds` | `None` | Measured balanced search rounds; overrides `repetitions`. |
-| `max_batches` | `100` | Batches per pass, or `None` for the full dataset. |
+| `max_batches` | `100` | Batches per epoch, or `None` for the full dataset. |
 | `max_workers` | available CPUs, up to 8 | Upper bound for the worker search. |
-| `seed` | `42` | Seed for execution order and bootstrap resampling. |
+| `seed` | `42` | Seed for execution order, RNG isolation, and bootstrap resampling. |
 | `validation` | `True` | Enables independent paired validation. |
 | `validation_rounds` | `5` | Paired rounds for validation. |
 | `min_improvement` | `0.05` | Required relative gain, as a fraction. |
@@ -188,20 +286,43 @@ apdo benchmark \
   --html report.html
 ```
 
-DataLoader factory:
+Config-aware loader factory:
 
 ```bash
 apdo benchmark \
-  --dataset my_project.data:build_loader \
+  --factory my_project.data:build_loader \
   --device auto \
-  --no-validation \
+  --rounds 3 \
+  --validation-rounds 5 \
   --json loader-report.json
 ```
 
-The factory must be a zero-argument callable in an importable module. The current working directory is added to `sys.path`. On Windows, dataset classes must be defined at module level and guarded by the usual `if __name__ == "__main__"` pattern in scripts that start worker processes.
+End-to-end training with a config-aware factory:
+
+```bash
+apdo benchmark \
+  --factory my_project.data:build_train_loader \
+  --mode training \
+  --epochs 3 \
+  --training-step-factory my_project.train:create_training_step \
+  --training-rounds 2 \
+  --validation-policy minimum \
+  --device cuda \
+  --json training-report.json \
+  --html training-report.html
+```
+
+`--dataset MODULE:FACTORY` accepts a zero-argument factory returning a dataset or an existing `DataLoader`. `--factory MODULE:FACTORY` accepts a factory that takes a `LoaderConfig`. The current working directory is added to `sys.path`. On Windows, dataset and model classes must be defined at module level, and scripts that start worker processes need the usual `if __name__ == "__main__"` guard.
 
 Useful options:
 
+- `--mode loader|training`
+- `--epochs N`
+- `--training-step-factory MODULE:FACTORY`
+- `--training-rounds N`
+- `--training-validation-rounds N`
+- `--max-training-candidates N`
+- `--validation-policy minimum|positive`
 - `--seed`
 - `--rounds`
 - `--repetitions`
@@ -217,15 +338,16 @@ Useful options:
 
 ## Reports
 
-JSON reports use schema version 2 and include:
+JSON reports use schema version 3 and include:
 
-- APDO version, start time, duration, protocol version, seed, rounds, budget state, and executed search/validation orders.
-- Environment, benchmark settings, loader preservation details, method, and limitations.
-- Baseline, search recommendation, fastest configuration, final recommendation, validation status, and final gain.
-- Per-configuration per-round metrics, aggregate summaries, and failures.
+- APDO version, start time, duration, protocol version, benchmark mode, epochs, seed, rounds, budget state, and executed search/validation orders.
+- Environment, benchmark settings, loader preservation details, reproducibility status and risks, method, and limitations.
+- Baseline, search recommendation, fastest configuration, final recommendation, validation status, policy, and final gain.
+- Per-configuration per-round metrics, per-epoch cycle metrics, aggregate summaries, and failures.
+- Training details with end-to-end throughput, step latency, data wait, transfer time, and selected configuration summaries.
 - Complete validation observations and bootstrap results.
 
-HTML reports are self-contained, contain no remote assets, escape benchmark data, and include a dedicated `Recommendation Validation` section.
+HTML reports are self-contained, contain no remote assets, escape benchmark data, and include dedicated recommendation-validation, training, and reproducibility sections.
 
 ## When the candidate is not confirmed
 
@@ -239,11 +361,12 @@ if result.validation.status != "confirmed":
 
 ## Benchmark workloads
 
-The repository includes three deterministic local workloads designed for tuning sessions rather than CI:
+The repository includes four deterministic local workloads designed for tuning sessions rather than CI:
 
 - `in-memory`: preloaded tensor features with light preprocessing.
 - `disk-backed`: generated local binary records with deterministic random access.
 - `cpu-heavy`: per-sample matrix operations that make worker parallelism visible.
+- `training`: a real MLP forward pass, cross-entropy loss, backward pass, and optimizer step.
 
 Run all workloads:
 
@@ -255,6 +378,12 @@ Fast smoke run:
 
 ```bash
 python benchmarks/run_workloads.py --workload in-memory --rounds 2 --validation-rounds 2 --max-batches 10
+```
+
+Training workload:
+
+```bash
+python benchmarks/run_workloads.py --workload training --device cuda --epochs 3 --training-rounds 2
 ```
 
 Generated data and reports are written to ignored directories under `benchmarks/.cache/` and `benchmarks/results/`. The workloads require no network access.
@@ -283,14 +412,15 @@ python -m twine check dist/*
 
 ## Compatibility and limitations
 
-- v0.1.0 calls to `optimize(dataset, batch_size=...)` remain supported.
+- v0.1.0 and v0.2.0 calls to `optimize(dataset, batch_size=...)` remain supported.
+- v0.3.0 adds training mode, loader factories, multi-epoch metrics, reproducibility reporting, and JSON schema version 3 with protocol version 3.0.
 - The two-stage search, bootstrap selection, memory guard, CUDA transfer measurement, CLI, and reports remain available.
-- v0.2.0 changes the JSON schema to version 2 and adds validation fields.
 - Only map-style datasets with `__len__` and `__getitem__` are supported.
-- Validation confirms a gain for the measured workload; it is not a universal guarantee.
-- Measurements cover data loading and CUDA host-to-device copies, not model training.
+- Loader mode measures data loading; it does not measure model training. Training mode measures the user-supplied model step, so model architecture and device work affect the result.
+- Validation confirms a gain for the measured workload and policy; it is not a universal guarantee.
+- APDO isolates supported loader generators and samplers and restores supported global RNG state. Arbitrary mutable state hidden inside dataset, transform, worker-initialization, or factory code cannot be fully inspected.
+- Training mode refuses loaders whose detected isolation status is not reproducible enough. Factory-managed state is the user's responsibility.
 - `max_ram_gb` is a sampled guard, not a hard memory limit.
-- APDO does not reset dataset, sampler, transform, global RNG state, or GPU memory pools.
 - macOS is not covered by CI in this release.
 
 See `CHANGELOG.md` for release history. Licensed under MIT.

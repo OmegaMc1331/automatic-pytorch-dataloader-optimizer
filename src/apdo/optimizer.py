@@ -15,20 +15,28 @@ from apdo.benchmark import (
     ConfigMeasurement,
     StageResult,
     benchmark_rounds,
-    plan_from_template,
+    benchmark_source,
 )
-from apdo.config import BENCHMARK_PROTOCOL_VERSION, BenchmarkSettings, LoaderConfig
-from apdo.errors import BenchmarkError, ConfigurationError
+from apdo.config import (
+    BENCHMARK_MODES,
+    BENCHMARK_PROTOCOL_VERSION,
+    MAX_BENCHMARK_EPOCHS,
+    VALIDATION_POLICIES,
+    BenchmarkSettings,
+    LoaderConfig,
+)
+from apdo.errors import BenchmarkError, ConfigurationError, DatasetError
 from apdo.loader import (
+    LoaderFactory,
+    LoaderSource,
     LoaderTemplate,
-    compatibility_warnings,
     initial_loader_config,
-    map_dataset_length,
 )
 from apdo.metrics import MetricsSummary
 from apdo.order import RoundOrder
 from apdo.report import OptimizationResult
 from apdo.resources import available_cpu_count, collect_environment
+from apdo.training import TrainingStepFactory
 from apdo.validation import (
     ValidationObservation,
     ValidationResult,
@@ -42,14 +50,13 @@ DEFAULT_SEED = 42
 DEFAULT_ROUNDS = 3
 DEFAULT_VALIDATION_ROUNDS = 5
 DEFAULT_MIN_IMPROVEMENT = 0.05
+DEFAULT_TRAINING_EPOCHS = 3
+DEFAULT_TRAINING_ROUNDS = 2
+DEFAULT_MAX_TRAINING_CANDIDATES = 3
 FINALIST_WORKERS = 2
 PIN_CANDIDATES = (False, True)
 PREFETCH_CANDIDATES = (2, 4)
 PERSISTENT_CANDIDATES = (False, True)
-REPRODUCIBILITY_WARNING = (
-    "APDO does not reset dataset, sampler, transform, or global RNG state. "
-    "Stateful or random data pipelines can reduce comparability between rounds."
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +74,14 @@ def optimize(
     max_ram_gb: float | None = None,
     *,
     dataloader: DataLoader | None = None,
+    dataloader_factory: LoaderFactory | None = None,
+    mode: str = "loader",
+    epochs: int | None = None,
+    training_step_factory: TrainingStepFactory | None = None,
+    training_rounds: int | None = None,
+    training_validation_rounds: int | None = None,
+    max_training_candidates: int = DEFAULT_MAX_TRAINING_CANDIDATES,
+    validation_policy: str = "minimum",
     warmup_runs: int = 1,
     repetitions: int = DEFAULT_ROUNDS,
     rounds: int | None = None,
@@ -109,15 +124,61 @@ def optimize(
     if progress is not None and not callable(progress):
         raise ConfigurationError("progress must be callable or None")
     max_ram_value = _positive_float(max_ram_gb, "max_ram_gb")
+    if mode not in BENCHMARK_MODES:
+        raise ConfigurationError(f"mode must be one of {BENCHMARK_MODES}")
+    if validation_policy not in VALIDATION_POLICIES:
+        raise ConfigurationError(f"validation_policy must be one of {VALIDATION_POLICIES}")
+    resolved_epochs = (
+        (DEFAULT_TRAINING_EPOCHS if mode == "training" else 1)
+        if epochs is None
+        else _positive_int(epochs, "epochs")
+    )
+    if resolved_epochs > MAX_BENCHMARK_EPOCHS:
+        raise ConfigurationError(f"epochs must be at most {MAX_BENCHMARK_EPOCHS}")
+    training_rounds_value = (
+        DEFAULT_TRAINING_ROUNDS
+        if training_rounds is None
+        else _positive_int(training_rounds, "training_rounds")
+    )
+    if training_rounds_value < 2:
+        raise ConfigurationError("training_rounds must be at least 2")
+    training_validation_value = (
+        validation_rounds
+        if training_validation_rounds is None
+        else _positive_int(training_validation_rounds, "training_validation_rounds")
+    )
+    if validation and training_validation_value < 2:
+        raise ConfigurationError(
+            "training_validation_rounds must be at least 2 when validation is enabled"
+        )
+    max_training_candidates = _positive_int(
+        max_training_candidates,
+        "max_training_candidates",
+    )
+    if mode == "training" and training_step_factory is None:
+        raise ConfigurationError(
+            "training mode requires training_step_factory; APDO never starts model "
+            "training implicitly"
+        )
+    if mode == "loader" and training_step_factory is not None:
+        raise ConfigurationError("training_step_factory requires mode='training'")
+    if training_step_factory is not None and not callable(training_step_factory):
+        raise ConfigurationError("training_step_factory must be callable")
 
-    template, initial_config, input_kind, explicit_batch_size = _prepare_input(
+    source, initial_config, explicit_batch_size = _prepare_source(
         dataset,
         dataloader,
+        dataloader_factory,
         batch_size,
         sample_count_fn,
     )
-    plan = plan_from_template(template, max_batches)
-    dataset_size = map_dataset_length(template.dataset)
+    if mode == "training" and not source.isolation.training_allowed:
+        raise ConfigurationError(
+            "training mode requires a reproducible training environment; "
+            f"reproducibility status is {source.isolation.status}: {source.isolation.reason}"
+        )
+    plan = _plan_for_source(source, max_batches)
+    dataset_size = source.dataset_size
     requested_device = str(device)
     resolved_device = resolve_device(device)
 
@@ -128,6 +189,7 @@ def optimize(
     environment = collect_environment()
     cpu_count = available_cpu_count()
     resolved_max_workers = _resolve_max_workers(max_workers, cpu_count)
+    validation_rounds_used = training_validation_value if mode == "training" else validation_rounds
     settings = BenchmarkSettings(
         batch_size=explicit_batch_size,
         requested_device=requested_device,
@@ -141,14 +203,21 @@ def optimize(
         cpu_count=cpu_count,
         seed=seed,
         rounds=effective_rounds,
-        validation_rounds=validation_rounds,
+        validation_rounds=validation_rounds_used,
         min_improvement=min_improvement,
         validation_enabled=validation,
         time_budget_s=time_budget,
         initial_config=initial_config,
-        input_kind=input_kind,
+        input_kind=source.input_kind,
         protocol_version=BENCHMARK_PROTOCOL_VERSION,
         expected_batches=plan.batches,
+        benchmark_mode=mode,
+        epochs=resolved_epochs,
+        training_rounds=training_rounds_value,
+        training_validation_rounds=training_validation_value,
+        max_training_candidates=max_training_candidates,
+        validation_policy=validation_policy,
+        reproducibility_status=source.isolation.status,
     )
 
     warnings = _initial_warnings(
@@ -160,7 +229,9 @@ def optimize(
         max_ram_value=max_ram_value,
         environment_has_memory=environment.available_memory_bytes is not None,
         initial_config=initial_config,
-        template=template,
+        source=source,
+        mode=mode,
+        epochs=resolved_epochs,
     )
     if rounds is not None and repetitions != DEFAULT_ROUNDS:
         warnings.append(
@@ -172,8 +243,10 @@ def optimize(
     pin_options = _pin_options(resolved_device)
     worker_counts = _build_worker_counts(resolved_max_workers, cpu_count)
     stage_one = _stage_one_configs(worker_counts, pin_options, initial_config)
+    stage_total = 3 if mode == "training" else 2
+    search_epochs = 1 if mode == "training" else resolved_epochs
     stage_one_result = _run_stage(
-        template=template,
+        source=source,
         configs=stage_one,
         phase="worker_scan",
         progress=progress,
@@ -185,7 +258,8 @@ def optimize(
         seed=seed,
         deadline=deadline,
         stage_number=1,
-        stage_total=2,
+        stage_total=stage_total,
+        epochs=search_epochs,
     )
     measurements = list(stage_one_result.measurements)
     orders = list(stage_one_result.orders)
@@ -231,14 +305,14 @@ def optimize(
 
     if time_budget is not None and time.perf_counter() >= deadline:
         budget_exhausted = True
-        _emit(progress, "Stage 2/2: skipped because the time budget was exhausted")
+        _emit(progress, "Stage 2: skipped because the time budget was exhausted")
         warnings.append(
-            "The time budget was exhausted before stage 2; only stage-one configurations "
-            "were considered."
+            "The time budget was exhausted before the flag sweep; only stage-one "
+            "configurations were considered."
         )
     elif stage_two:
         stage_two_result = _run_stage(
-            template=template,
+            source=source,
             configs=stage_two,
             phase="flag_sweep",
             progress=progress,
@@ -250,18 +324,69 @@ def optimize(
             seed=seed,
             deadline=deadline,
             stage_number=2,
-            stage_total=2,
+            stage_total=stage_total,
+            epochs=search_epochs,
         )
         measurements.extend(stage_two_result.measurements)
         orders.extend(stage_two_result.orders)
         budget_exhausted = budget_exhausted or stage_two_result.budget_exhausted
         if stage_two_result.budget_exhausted:
-            warnings.append("The time budget stopped stage 2 before all planned rounds completed.")
+            warnings.append("The time budget stopped the flag sweep before all rounds completed.")
     else:
-        _emit(progress, "Stage 2/2: no additional multi-worker configurations to test")
+        _emit(progress, "Stage 2: no additional multi-worker configurations to test")
 
-    _emit(progress, "Selecting a search recommendation")
-    selection = _select_configuration(measurements)
+    _emit(progress, "Selecting a loader search recommendation")
+    loader_selection = _select_configuration(measurements)
+    selection = loader_selection
+    if mode == "training":
+        baseline = _measurement_for_config(measurements, initial_config)
+        training_candidates = _training_candidates(
+            baseline=baseline,
+            selection=loader_selection,
+            measurements=measurements,
+            limit=max_training_candidates,
+        )
+        training_result = _run_stage(
+            source=source,
+            configs=training_candidates,
+            phase="training_finalists",
+            progress=progress,
+            device=resolved_device,
+            plan=plan,
+            warmup_rounds=warmup_runs,
+            rounds=training_rounds_value,
+            max_ram_bytes=max_ram_bytes,
+            seed=seed,
+            deadline=deadline,
+            stage_number=3,
+            stage_total=stage_total,
+            epochs=resolved_epochs,
+            training_step_factory=training_step_factory,
+        )
+        measurements.extend(training_result.measurements)
+        orders.extend(training_result.orders)
+        budget_exhausted = budget_exhausted or training_result.budget_exhausted
+        training_successes = [item for item in training_result.measurements if item.succeeded]
+        baseline = next(
+            (item for item in training_successes if item.config == initial_config),
+            None,
+        )
+        if baseline is None:
+            detail = "\n".join(_failure_lines(training_result.measurements))
+            raise BenchmarkError(
+                "The initial configuration did not complete a successful training "
+                "measurement, so APDO cannot establish a safe fallback.\n" + detail
+            )
+        selection = _select_configuration(training_successes)
+        if training_result.budget_exhausted:
+            warnings.append(
+                "The time budget stopped training finalists before all planned rounds completed."
+            )
+        warnings.append(
+            "Training throughput includes the user-supplied forward, backward, and "
+            "optimizer step on the resolved device."
+        )
+
     baseline_summary = _summary(baseline)
     selected_summary = _summary(selection.selected)
     search_improvement = (
@@ -271,7 +396,7 @@ def optimize(
     failures = [item for item in measurements if not item.succeeded]
     if failures:
         warnings.append(
-            f"{len(failures)} of {len(measurements)} search configurations failed; "
+            f"{len(failures)} of {len(measurements)} configurations failed; "
             "see the report for details."
         )
     if len(stage_one_successes) == 1 and not stage_two:
@@ -290,11 +415,12 @@ def optimize(
         )
 
     validation_result, validation_orders, validation_budget = _run_validation(
-        template=template,
+        template=source.template,
+        source=source,
         baseline_config=initial_config,
         candidate_config=selection.selected.config,
         enabled=validation,
-        validation_rounds=validation_rounds,
+        validation_rounds=validation_rounds_used,
         warmup_rounds=warmup_runs,
         min_improvement=min_improvement,
         device=resolved_device,
@@ -303,6 +429,9 @@ def optimize(
         seed=seed,
         deadline=deadline,
         progress=progress,
+        epochs=resolved_epochs,
+        training_step_factory=training_step_factory,
+        validation_policy=validation_policy,
     )
     orders.extend(validation_orders)
     budget_exhausted = budget_exhausted or validation_budget
@@ -350,7 +479,8 @@ def optimize(
         duration_s=duration_s,
         validation=validation_result,
         round_orders=tuple(orders),
-        loader_template=template,
+        loader_template=source.template if source.factory is None else None,
+        loader_source=source,
         search_improvement_percent=search_improvement,
         search_selection_reason=selection.reason,
         budget_exhausted=budget_exhausted,
@@ -376,18 +506,38 @@ def resolve_device(device: str | torch.device) -> torch.device:
             )
     elif resolved.type != "cpu":
         raise ConfigurationError(
-            f"device type {resolved.type!r} is not supported in v0.2.0; "
+            f"device type {resolved.type!r} is not supported in v0.3.0; "
             "use 'auto', 'cpu', or 'cuda'"
         )
     return resolved
 
 
-def _prepare_input(
+def _prepare_source(
     dataset: Dataset | DataLoader | None,
     dataloader: DataLoader | None,
+    dataloader_factory: LoaderFactory | None,
     batch_size: int | None,
     sample_count_fn: Callable[[Any], int] | None,
-) -> tuple[LoaderTemplate, LoaderConfig, str, int | None]:
+) -> tuple[LoaderSource, LoaderConfig, int | None]:
+    provided = sum(value is not None for value in (dataset, dataloader, dataloader_factory))
+    if provided == 0:
+        raise ConfigurationError("pass a dataset or a dataloader, or provide a dataloader_factory")
+    if provided > 1:
+        raise ConfigurationError(
+            "pass either dataset or dataloader, not both; dataloader_factory is also "
+            "mutually exclusive with dataset and dataloader"
+        )
+    if dataloader_factory is not None:
+        if batch_size is not None:
+            raise ConfigurationError(
+                "batch_size cannot override a dataloader_factory; the factory owns the "
+                "batch size and loader construction"
+            )
+        source = LoaderSource.from_factory(
+            dataloader_factory,
+            sample_count_fn=sample_count_fn,
+        )
+        return source, LoaderConfig(), source.batch_size
     if isinstance(dataset, DataLoader):
         if dataloader is not None:
             raise ConfigurationError("pass either dataset or dataloader, not both")
@@ -395,8 +545,6 @@ def _prepare_input(
         dataset = None
     if dataset is not None and dataloader is not None:
         raise ConfigurationError("pass either dataset or dataloader, not both")
-    if dataset is None and dataloader is None:
-        raise ConfigurationError("pass a dataset or a dataloader")
 
     if dataloader is not None:
         if not isinstance(dataloader, DataLoader):
@@ -413,7 +561,8 @@ def _prepare_input(
             sample_count_fn=sample_count_fn,
         )
         initial_config = initial_loader_config(dataloader)
-        return template, initial_config, "dataloader", dataloader.batch_size
+        source = LoaderSource.from_template(template, "dataloader")
+        return source, initial_config, dataloader.batch_size
 
     resolved_batch_size = 32 if batch_size is None else _positive_int(batch_size, "batch_size")
     template = LoaderTemplate.from_dataset(
@@ -421,7 +570,65 @@ def _prepare_input(
         resolved_batch_size,
         sample_count_fn=sample_count_fn,
     )
-    return template, LoaderConfig(), "dataset", resolved_batch_size
+    source = LoaderSource.from_template(template, "dataset")
+    return source, LoaderConfig(), resolved_batch_size
+
+
+def _plan_for_source(source: LoaderSource, max_batches: int | None) -> BatchPlan:
+    total_batches = source.expected_batches
+    if total_batches < 2:
+        raise DatasetError(
+            f"the loader produces only {total_batches} batch; at least two batches are required"
+        )
+    if max_batches is not None and max_batches < 2:
+        raise ConfigurationError("max_batches must be at least 2 or None")
+    batches = total_batches if max_batches is None else min(total_batches, max_batches)
+    return BatchPlan(
+        batches=batches,
+        steady_samples=0,
+        expected_batches=total_batches,
+        full_epoch=batches == total_batches,
+    )
+
+
+def _training_candidates(
+    *,
+    baseline: ConfigMeasurement,
+    selection: _Selection,
+    measurements: Sequence[ConfigMeasurement],
+    limit: int,
+) -> list[LoaderConfig]:
+    ordered = [baseline.config, selection.selected.config, selection.fastest.config]
+    ranked = sorted(
+        (item for item in measurements if item.succeeded and item.summary is not None),
+        key=lambda item: _summary(item).median_throughput,
+        reverse=True,
+    )
+    ordered.extend(item.config for item in ranked)
+    unique: list[LoaderConfig] = []
+    for config in ordered:
+        if config not in unique:
+            unique.append(config)
+        if len(unique) >= limit:
+            break
+    return unique
+
+
+def _measurement_for_config(
+    measurements: Sequence[ConfigMeasurement],
+    config: LoaderConfig,
+) -> ConfigMeasurement:
+    measurement = next(
+        (
+            item
+            for item in measurements
+            if item.succeeded and item.config == config and item.summary is not None
+        ),
+        None,
+    )
+    if measurement is None:
+        raise BenchmarkError(f"no successful measurement is available for {config.describe()}")
+    return measurement
 
 
 def _initial_warnings(
@@ -434,7 +641,9 @@ def _initial_warnings(
     max_ram_value: float | None,
     environment_has_memory: bool,
     initial_config: LoaderConfig,
-    template: LoaderTemplate,
+    source: LoaderSource,
+    mode: str,
+    epochs: int,
 ) -> list[str]:
     warnings: list[str] = []
     if plan.batches < 4:
@@ -462,14 +671,32 @@ def _initial_warnings(
             "Available system memory could not be read; max_ram_gb cannot be enforced "
             "on this platform."
         )
-    warnings.append(REPRODUCIBILITY_WARNING)
-    warnings.extend(compatibility_warnings(template))
+    if epochs > 1:
+        if mode == "training":
+            warnings.append(
+                f"Training trials reuse one DataLoader for {epochs} epochs and exclude the "
+                "first epoch from sustained throughput; loader screening uses one epoch."
+            )
+        else:
+            warnings.append(
+                f"Loader measurements reuse one DataLoader for {epochs} epochs; sustained "
+                "throughput excludes the first epoch."
+            )
+    if source.isolation.status != "verified":
+        warnings.append(source.isolation.reason)
+    if source.factory is not None:
+        warnings.extend(source.compatibility_warnings())
+    if mode == "training":
+        warnings.append(
+            "Training mode executes the explicit training_step_factory. The factory owns "
+            "model, optimizer, loss, and environment reset behavior for every trial."
+        )
     return warnings
 
 
 def _run_stage(
     *,
-    template: LoaderTemplate,
+    source: LoaderSource,
     configs: Sequence[LoaderConfig],
     phase: str,
     progress: Callable[[str], None] | None,
@@ -482,14 +709,16 @@ def _run_stage(
     deadline: float | None,
     stage_number: int,
     stage_total: int,
+    epochs: int = 1,
+    training_step_factory: TrainingStepFactory | None = None,
 ) -> StageResult:
     _emit(
         progress,
         f"Stage {stage_number}/{stage_total}: {phase} with {len(configs)} configurations, "
-        f"{rounds} measured rounds",
+        f"{rounds} measured rounds, {epochs} epoch(s)",
     )
-    result = benchmark_rounds(
-        template,
+    result = benchmark_source(
+        source,
         configs,
         phase=phase,
         device=device,
@@ -500,14 +729,17 @@ def _run_stage(
         seed=seed,
         deadline=deadline,
         progress=progress,
+        epochs=epochs,
+        training_step_factory=training_step_factory,
     )
     for measurement in result.measurements:
         if measurement.succeeded:
             summary = _summary(measurement)
+            unit = "samples/s" if measurement.training else "loader samples/s"
             _emit(
                 progress,
                 f"  {measurement.config.describe()}: "
-                f"{summary.median_throughput:,.1f} samples/s across "
+                f"{summary.median_throughput:,.1f} {unit} across "
                 f"{len(measurement.passes)} rounds",
             )
         else:
@@ -521,7 +753,7 @@ def _run_stage(
 
 def _run_validation(
     *,
-    template: LoaderTemplate,
+    template: LoaderTemplate | None,
     baseline_config: LoaderConfig,
     candidate_config: LoaderConfig,
     enabled: bool,
@@ -534,6 +766,10 @@ def _run_validation(
     seed: int,
     deadline: float | None,
     progress: Callable[[str], None] | None,
+    source: LoaderSource | None = None,
+    epochs: int = 1,
+    training_step_factory: TrainingStepFactory | None = None,
+    validation_policy: str = "minimum",
 ) -> tuple[ValidationResult, tuple[RoundOrder, ...], bool]:
     if candidate_config == baseline_config:
         result = analyze_validation(
@@ -543,6 +779,7 @@ def _run_validation(
             enabled=enabled,
             min_improvement=min_improvement,
             seed=seed,
+            policy=validation_policy,
         )
         return result, (), False
     if not enabled:
@@ -553,6 +790,7 @@ def _run_validation(
             enabled=False,
             min_improvement=min_improvement,
             seed=seed,
+            policy=validation_policy,
         )
         return result, (), False
     if deadline is not None and time.perf_counter() >= deadline:
@@ -564,27 +802,51 @@ def _run_validation(
             min_improvement=min_improvement,
             seed=seed,
             failures=("Independent validation was skipped because the time budget expired.",),
+            policy=validation_policy,
         )
         return result, (), True
+    legacy_template = template if source is None else None
+    if source is None:
+        if template is None:
+            raise ConfigurationError("validation requires a loader source or template")
+        source = LoaderSource.from_template(template, "dataloader")
 
     _emit(
         progress,
         f"Independent validation: alternating {baseline_config.describe()} and "
         f"{candidate_config.describe()} for {validation_rounds} rounds",
     )
-    stage = benchmark_rounds(
-        template,
-        (baseline_config, candidate_config),
-        phase="validation",
-        device=device,
-        plan=plan,
-        warmup_rounds=warmup_rounds,
-        rounds=validation_rounds,
-        max_ram_bytes=max_ram_bytes,
-        seed=seed,
-        deadline=deadline,
-        progress=progress,
-    )
+    if training_step_factory is None and legacy_template is not None:
+        stage = benchmark_rounds(
+            legacy_template,
+            (baseline_config, candidate_config),
+            phase="validation",
+            device=device,
+            plan=plan,
+            warmup_rounds=warmup_rounds,
+            rounds=validation_rounds,
+            max_ram_bytes=max_ram_bytes,
+            seed=seed,
+            deadline=deadline,
+            progress=progress,
+            epochs=epochs,
+        )
+    else:
+        stage = benchmark_source(
+            source,
+            (baseline_config, candidate_config),
+            phase="validation",
+            device=device,
+            plan=plan,
+            warmup_rounds=warmup_rounds,
+            rounds=validation_rounds,
+            max_ram_bytes=max_ram_bytes,
+            seed=seed,
+            deadline=deadline,
+            progress=progress,
+            epochs=epochs,
+            training_step_factory=training_step_factory,
+        )
     by_config = {item.config: item for item in stage.measurements}
     baseline_measurement = by_config[baseline_config]
     candidate_measurement = by_config[candidate_config]
@@ -623,6 +885,7 @@ def _run_validation(
         min_improvement=min_improvement,
         seed=seed,
         failures=failure_messages,
+        policy=validation_policy,
     )
     return result, stage.orders, stage.budget_exhausted
 

@@ -8,6 +8,53 @@ from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
+class CycleMetrics:
+    cycle_index: int
+    startup_s: float
+    duration_s: float
+    batches: int
+    samples: int
+    throughput: float
+    steady_elapsed_s: float
+    steady_samples: int
+    steady_throughput: float
+    latencies_s: tuple[float, ...]
+    worker_pids: tuple[int, ...] = ()
+    rss_bytes: int | None = None
+    data_wait_s: float | None = None
+    transfer_s: float | None = None
+    transfer_bytes: int | None = None
+    transfer_active: bool = False
+    step_latencies_s: tuple[float, ...] = ()
+    first_batch_samples: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "cycle_index": self.cycle_index,
+            "startup_s": self.startup_s,
+            "duration_s": self.duration_s,
+            "batches": self.batches,
+            "samples": self.samples,
+            "throughput": self.throughput,
+            "steady_elapsed_s": self.steady_elapsed_s,
+            "steady_samples": self.steady_samples,
+            "steady_throughput": self.steady_throughput,
+            "median_latency_s": median(self.latencies_s) if self.latencies_s else None,
+            "p95_latency_s": percentile(self.latencies_s, 0.95) if self.latencies_s else None,
+            "worker_pids": list(self.worker_pids),
+            "rss_bytes": self.rss_bytes,
+            "data_wait_s": self.data_wait_s,
+            "transfer_s": self.transfer_s,
+            "transfer_bytes": self.transfer_bytes,
+            "transfer_active": self.transfer_active,
+            "first_batch_samples": self.first_batch_samples,
+            "median_step_latency_s": (
+                median(self.step_latencies_s) if self.step_latencies_s else None
+            ),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class PassMetrics:
     startup_s: float
     steady_elapsed_s: float
@@ -16,8 +63,22 @@ class PassMetrics:
     throughput: float
     latencies_s: tuple[float, ...]
     gpu_transfer_active: bool = False
+    construction_s: float | None = None
+    training_setup_s: float | None = None
+    total_elapsed_s: float | None = None
+    sustained_throughput: float | None = None
+    cycles: tuple[CycleMetrics, ...] = ()
+    expected_batches: int | None = None
+    full_epoch: bool = True
+    training: bool = False
+    data_wait_s: float | None = None
+    transfer_s: float | None = None
+    transfer_bytes: int | None = None
+    worker_startup_overhead_s: float | None = None
+    average_epoch_transition_s: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
+        step_latencies = [value for cycle in self.cycles for value in cycle.step_latencies_s]
         return {
             "startup_s": self.startup_s,
             "steady_elapsed_s": self.steady_elapsed_s,
@@ -26,6 +87,20 @@ class PassMetrics:
             "throughput": self.throughput,
             "median_latency_s": median(self.latencies_s) if self.latencies_s else None,
             "p95_latency_s": percentile(self.latencies_s, 0.95) if self.latencies_s else None,
+            "construction_s": self.construction_s,
+            "training_setup_s": self.training_setup_s,
+            "total_elapsed_s": self.total_elapsed_s,
+            "sustained_throughput": self.sustained_throughput,
+            "expected_batches": self.expected_batches,
+            "full_epoch": self.full_epoch,
+            "training": self.training,
+            "data_wait_s": self.data_wait_s,
+            "transfer_s": self.transfer_s,
+            "transfer_bytes": self.transfer_bytes,
+            "worker_startup_overhead_s": self.worker_startup_overhead_s,
+            "average_epoch_transition_s": self.average_epoch_transition_s,
+            "median_step_latency_s": median(step_latencies) if step_latencies else None,
+            "cycles": [cycle.to_dict() for cycle in self.cycles],
         }
 
 
@@ -46,6 +121,15 @@ class MetricsSummary:
     peak_process_rss_bytes: int | None
     peak_system_used_bytes: int | None
     peak_gpu_memory_bytes: int | None
+    median_sustained_throughput: float | None = None
+    median_first_cycle_throughput: float | None = None
+    median_subsequent_cycle_throughput: float | None = None
+    median_worker_startup_overhead_s: float | None = None
+    median_epoch_transition_s: float | None = None
+    median_step_latency_s: float | None = None
+    median_data_wait_s: float | None = None
+    median_transfer_s: float | None = None
+    total_transfer_bytes: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -64,6 +148,15 @@ class MetricsSummary:
             "peak_process_rss_bytes": self.peak_process_rss_bytes,
             "peak_system_used_bytes": self.peak_system_used_bytes,
             "peak_gpu_memory_bytes": self.peak_gpu_memory_bytes,
+            "median_sustained_throughput": self.median_sustained_throughput,
+            "median_first_cycle_throughput": self.median_first_cycle_throughput,
+            "median_subsequent_cycle_throughput": self.median_subsequent_cycle_throughput,
+            "median_worker_startup_overhead_s": self.median_worker_startup_overhead_s,
+            "median_epoch_transition_s": self.median_epoch_transition_s,
+            "median_step_latency_s": self.median_step_latency_s,
+            "median_data_wait_s": self.median_data_wait_s,
+            "median_transfer_s": self.median_transfer_s,
+            "total_transfer_bytes": self.total_transfer_bytes,
         }
 
 
@@ -150,6 +243,14 @@ def summarize_passes(
         resamples=resamples,
         seed=seed,
     )
+    step_latencies = [
+        value for item in passes for cycle in item.cycles for value in cycle.step_latencies_s
+    ]
+    data_waits = [value for item in passes for value in (item.data_wait_s,) if value is not None]
+    transfers = [value for item in passes for value in (item.transfer_s,) if value is not None]
+    transfer_bytes = [
+        value for item in passes for value in (item.transfer_bytes,) if value is not None
+    ]
     return MetricsSummary(
         median_throughput=median(throughputs),
         mean_throughput=average,
@@ -166,4 +267,37 @@ def summarize_passes(
         peak_process_rss_bytes=peak_process_rss_bytes,
         peak_system_used_bytes=peak_system_used_bytes,
         peak_gpu_memory_bytes=peak_gpu_memory_bytes,
+        median_sustained_throughput=_median_optional(
+            [item.sustained_throughput for item in passes]
+        ),
+        median_first_cycle_throughput=_median_optional(
+            [item.cycles[0].throughput if item.cycles else item.throughput for item in passes]
+        ),
+        median_subsequent_cycle_throughput=_median_optional(
+            [_subsequent_cycle_throughput(item) for item in passes]
+        ),
+        median_worker_startup_overhead_s=_median_optional(
+            [item.worker_startup_overhead_s for item in passes]
+        ),
+        median_epoch_transition_s=_median_optional(
+            [item.average_epoch_transition_s for item in passes]
+        ),
+        median_step_latency_s=_median_optional(step_latencies),
+        median_data_wait_s=_median_optional(data_waits),
+        median_transfer_s=_median_optional(transfers),
+        total_transfer_bytes=sum(transfer_bytes) if transfer_bytes else None,
     )
+
+
+def _subsequent_cycle_throughput(metrics: PassMetrics) -> float | None:
+    cycles = metrics.cycles[1:]
+    if not cycles:
+        return None
+    samples = sum(cycle.samples for cycle in cycles)
+    duration = sum(cycle.duration_s for cycle in cycles)
+    return samples / duration if duration > 0 else None
+
+
+def _median_optional(values: Sequence[float | None]) -> float | None:
+    present = [value for value in values if value is not None]
+    return median(present) if present else None

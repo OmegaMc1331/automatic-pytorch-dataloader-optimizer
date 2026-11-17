@@ -43,13 +43,18 @@ def test_benchmark_help() -> None:
     assert "--min-improvement" in completed.stdout
     assert "--time-budget-s" in completed.stdout
     assert "--no-validation" in completed.stdout
+    assert "--factory" in completed.stdout
+    assert "--mode" in completed.stdout
+    assert "--epochs" in completed.stdout
+    assert "--training-step-factory" in completed.stdout
+    assert "--validation-policy" in completed.stdout
 
 
 def test_version() -> None:
     completed = run_cli("--version")
 
     assert completed.returncode == 0
-    assert "apdo 0.2.0" in completed.stdout
+    assert "apdo 0.3.0" in completed.stdout
 
 
 def test_no_command_prints_help() -> None:
@@ -158,3 +163,41 @@ def test_invalid_dataset_specification_is_reported() -> None:
 
     assert completed.returncode == 1
     assert "expected MODULE:FACTORY" in completed.stderr
+
+
+def test_training_benchmark_with_factory(tmp_path: Path) -> None:
+    json_path = tmp_path / "training.json"
+
+    completed = run_cli(
+        "benchmark",
+        "--factory",
+        "examples.synthetic_dataset:create_training_loader",
+        "--mode",
+        "training",
+        "--epochs",
+        "1",
+        "--training-step-factory",
+        "examples.synthetic_dataset:training_step_factory",
+        "--training-rounds",
+        "2",
+        "--device",
+        "cpu",
+        "--max-batches",
+        "2",
+        "--repetitions",
+        "2",
+        "--no-validation",
+        "--max-workers",
+        "1",
+        "--json",
+        str(json_path),
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert payload["settings"]["input_kind"] == "dataloader_factory"
+    assert payload["settings"]["benchmark_mode"] == "training"
+    assert payload["settings"]["epochs"] == 1
+    assert payload["search"]["throughput_kind"] == "end_to_end_training"
+    assert payload["training"]["epochs"] == 1
+    assert payload["reproducibility"]["status"] == "factory_managed"

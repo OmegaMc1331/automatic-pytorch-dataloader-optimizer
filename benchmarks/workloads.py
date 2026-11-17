@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from array import array
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import torch
+from torch import nn
 from torch.utils.data import Dataset
 
 
@@ -94,6 +97,46 @@ def materialize_disk_data(
     return path
 
 
+class TrainingNetwork(nn.Module):
+    def __init__(self, feature_dim: int = 64, hidden_dim: int = 256) -> None:
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 10),
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.layers(features)
+
+
+def build_training_step_factory(
+    device: str | torch.device,
+    *,
+    feature_dim: int = 64,
+    hidden_dim: int = 256,
+) -> Callable[[], Callable[[Any], None]]:
+    resolved_device = torch.device(device)
+    loss_fn = nn.CrossEntropyLoss()
+
+    def factory() -> Callable[[Any], None]:
+        model = TrainingNetwork(feature_dim, hidden_dim).to(resolved_device)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.05, momentum=0.9)
+
+        def step(batch: Any) -> None:
+            features, labels = batch
+            optimizer.zero_grad(set_to_none=True)
+            loss = loss_fn(model(features), labels)
+            loss.backward()
+            optimizer.step()
+
+        return step
+
+    return factory
+
+
 def build_workload(
     name: str,
     cache_directory: Path,
@@ -105,4 +148,8 @@ def build_workload(
         return DiskBackedDataset(path, size=2048, feature_dim=128), 32, 40
     if name == "cpu-heavy":
         return CpuHeavyDataset(), 32, 20
-    raise ValueError(f"unknown workload {name!r}; expected in-memory, disk-backed, or cpu-heavy")
+    if name == "training":
+        return InMemoryDataset(), 32, 20
+    raise ValueError(
+        f"unknown workload {name!r}; expected in-memory, disk-backed, cpu-heavy, or training"
+    )

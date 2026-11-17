@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from tests.helpers import (
     make_failed_measurement,
     make_measurement,
     make_result,
+    make_settings,
 )
 
 
@@ -51,8 +53,8 @@ def test_json_export(result, tmp_path: Path) -> None:
     result.to_json(target)
 
     payload = json.loads(target.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 2
-    assert payload["apdo_version"] == "0.2.0"
+    assert payload["schema_version"] == 3
+    assert payload["apdo_version"] == "0.3.0"
     assert payload["protocol"]["seed"] == 42
     assert payload["protocol"]["search_rounds"] == 3
     assert payload["recommended"]["config"]["num_workers"] == 1
@@ -101,3 +103,43 @@ def test_result_without_measurement_fails_cleanly() -> None:
         result.summary()
     with pytest.raises(ValueError):
         result.to_dict()
+
+
+def test_training_report_exposes_end_to_end_metrics(tmp_path: Path) -> None:
+    baseline = LoaderConfig()
+    best = LoaderConfig(num_workers=1, prefetch_factor=2)
+    measurements = tuple(
+        replace(make_measurement(config, values), training=True)
+        for config, values in (
+            (baseline, (100.0, 101.0, 100.0)),
+            (best, (120.0, 121.0, 120.0)),
+        )
+    )
+    settings = replace(
+        make_settings(initial_config=baseline),
+        benchmark_mode="training",
+        epochs=3,
+        training_rounds=2,
+        training_validation_rounds=2,
+    )
+    result = make_result(
+        measurements,
+        best,
+        best,
+        settings=settings,
+    )
+
+    payload = result.to_dict()
+    target = tmp_path / "training.html"
+    result.to_html(target)
+    html = target.read_text(encoding="utf-8")
+    text = result.summary()
+
+    assert payload["schema_version"] == 3
+    assert payload["search"]["throughput_kind"] == "end_to_end_training"
+    assert payload["training"]["epochs"] == 3
+    assert payload["training"]["selected"]["summary"]["median_throughput"] == 120.0
+    assert "training samples/s" in text
+    assert "epochs: 3" in text
+    assert "End-to-End Training" in html
+    assert "Reproducibility" in html

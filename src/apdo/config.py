@@ -5,7 +5,10 @@ from typing import Any
 
 from apdo.errors import ConfigurationError
 
-BENCHMARK_PROTOCOL_VERSION = "2.0"
+BENCHMARK_PROTOCOL_VERSION = "3.0"
+BENCHMARK_MODES = ("loader", "training")
+VALIDATION_POLICIES = ("minimum", "positive")
+MAX_BENCHMARK_EPOCHS = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,8 +98,15 @@ class BenchmarkSettings:
     time_budget_s: float | None = None
     initial_config: LoaderConfig = field(default_factory=LoaderConfig)
     input_kind: str = "dataset"
-    protocol_version: str = "2.0"
+    protocol_version: str = "3.0"
     expected_batches: int | None = None
+    benchmark_mode: str = "loader"
+    epochs: int = 1
+    training_rounds: int = 2
+    training_validation_rounds: int = 3
+    max_training_candidates: int = 3
+    validation_policy: str = "minimum"
+    reproducibility_status: str = "verified"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -120,4 +130,11 @@ class BenchmarkSettings:
             "input_kind": self.input_kind,
             "protocol_version": self.protocol_version,
             "expected_batches": self.expected_batches,
+            "benchmark_mode": self.benchmark_mode,
+            "epochs": self.epochs,
+            "training_rounds": self.training_rounds,
+            "training_validation_rounds": self.training_validation_rounds,
+            "max_training_candidates": self.max_training_candidates,
+            "validation_policy": self.validation_policy,
+            "reproducibility_status": self.reproducibility_status,
         }

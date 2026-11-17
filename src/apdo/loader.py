@@ -6,16 +6,29 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from torch.utils.data import DataLoader, Dataset, IterableDataset, Sampler
+from torch.utils.data import (
+    BatchSampler,
+    DataLoader,
+    Dataset,
+    IterableDataset,
+    RandomSampler,
+    Sampler,
+    SequentialSampler,
+    SubsetRandomSampler,
+    WeightedRandomSampler,
+)
 
 from apdo.config import LoaderConfig
 from apdo.errors import ConfigurationError, DatasetError
+from apdo.isolation import ReproducibilityInfo, clone_generator
+
+LoaderFactory = Callable[[LoaderConfig], DataLoader]
 
 
 def map_dataset_length(dataset: Any) -> int:
     if isinstance(dataset, IterableDataset):
         raise DatasetError(
-            "IterableDataset is not supported in v0.2.0; use a map-style dataset "
+            "IterableDataset is not supported in v0.3.0; use a map-style dataset "
             "with __len__ and __getitem__"
         )
     if not hasattr(dataset, "__getitem__"):
@@ -125,20 +138,35 @@ class LoaderTemplate:
             raise DatasetError("sampler produces no batches")
         return batches
 
-    def build(self, config: LoaderConfig) -> DataLoader:
+    def build(self, config: LoaderConfig, *, isolate: bool = False) -> DataLoader:
+        sampler = self.sampler
+        batch_sampler = self.batch_sampler
+        generator = self.generator
+        if isolate:
+            if generator is not None:
+                generator = clone_generator(generator)
+            if batch_sampler is not None:
+                isolated_batch_sampler = _isolated_batch_sampler(batch_sampler)
+                if isolated_batch_sampler is not None:
+                    batch_sampler = isolated_batch_sampler
+            else:
+                isolated_sampler = _isolated_sampler(sampler)
+                if isolated_sampler is not None:
+                    sampler = isolated_sampler
+
         kwargs: dict[str, Any] = {
             "dataset": self.dataset,
             "collate_fn": self.collate_fn,
             "timeout": self.timeout,
             "worker_init_fn": self.worker_init_fn,
-            "generator": self.generator,
+            "generator": generator,
             "in_order": self.in_order,
         }
-        if self.batch_sampler is not None:
-            kwargs["batch_sampler"] = self.batch_sampler
+        if batch_sampler is not None:
+            kwargs["batch_sampler"] = batch_sampler
         else:
             kwargs["batch_size"] = self.batch_size
-            kwargs["sampler"] = self.sampler
+            kwargs["sampler"] = sampler
             if self.batch_size is not None:
                 kwargs["drop_last"] = self.drop_last
         kwargs.update(config.to_dataloader_kwargs())
@@ -149,22 +177,294 @@ class LoaderTemplate:
         return DataLoader(**kwargs)
 
     def count_samples(self, batch: Any) -> int:
-        if self.unbatched:
-            return 1
-        if self.sample_count_fn is not None:
-            return _validated_count(self.sample_count_fn(batch))
-        counts = _leading_dimensions(batch)
-        if not counts:
-            raise DatasetError(
-                "could not determine the number of samples in a batch; return tensors "
-                "from collate_fn or pass sample_count_fn to optimize()"
+        return count_batch_samples(batch, unbatched=self.unbatched, fn=self.sample_count_fn)
+
+    def isolation_info(self) -> ReproducibilityInfo:
+        risks: list[str] = []
+        managed = ["global_rng"]
+        severe = False
+
+        if self.generator is not None:
+            managed.append("loader_generator")
+        if self.batch_sampler is not None:
+            if _isolated_batch_sampler(self.batch_sampler, clone=False) is None:
+                severe = True
+                risks.append(
+                    "The custom batch sampler cannot be reconstructed safely and is reused "
+                    "by reference, so its mutable state is shared with the original loader."
+                )
+            else:
+                managed.extend(("sampler", "batch_sampler"))
+        elif _isolated_sampler(self.sampler, clone=False) is None:
+            severe = True
+            risks.append(
+                "The custom sampler cannot be reconstructed safely and is reused by "
+                "reference, so its mutable state is shared with the original loader."
             )
-        if len(set(counts)) != 1:
-            raise DatasetError(
-                "batch fields have inconsistent leading dimensions "
-                f"{sorted(set(counts))}; pass sample_count_fn to optimize()"
+        else:
+            managed.append("sampler")
+
+        dataset_risk, dataset_severe = _dataset_state_risk(self.dataset)
+        if dataset_risk is not None:
+            risks.append(dataset_risk)
+            severe = severe or dataset_severe
+        if self.worker_init_fn is not None:
+            risks.append(
+                "A custom worker_init_fn is reused by reference. APDO cannot inspect or "
+                "reset state that it mutates inside worker processes."
             )
-        return counts[0]
+
+        if severe:
+            status = "not_guaranteed"
+        elif risks:
+            status = "partial"
+        else:
+            status = "verified"
+        reason = _isolation_reason(status, managed, risks)
+        return ReproducibilityInfo(
+            status=status,
+            managed=tuple(managed),
+            risks=tuple(risks),
+            reason=reason,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class LoaderSource:
+    factory: LoaderFactory | None
+    template: LoaderTemplate | None
+    expected_batches: int
+    unbatched: bool
+    batch_size: int | None
+    dataset_size: int
+    sample_count_fn: Callable[[Any], int] | None
+    isolation: ReproducibilityInfo
+    input_kind: str
+
+    @classmethod
+    def from_template(cls, template: LoaderTemplate, input_kind: str) -> LoaderSource:
+        return cls(
+            factory=None,
+            template=template,
+            expected_batches=template.expected_batches(),
+            unbatched=template.unbatched,
+            batch_size=template.batch_size,
+            dataset_size=map_dataset_length(template.dataset),
+            sample_count_fn=template.sample_count_fn,
+            isolation=template.isolation_info(),
+            input_kind=input_kind,
+        )
+
+    @classmethod
+    def from_factory(
+        cls,
+        factory: Callable[[LoaderConfig], DataLoader],
+        *,
+        sample_count_fn: Callable[[Any], int] | None,
+    ) -> LoaderSource:
+        if not callable(factory):
+            raise ConfigurationError("dataloader_factory must be callable")
+        try:
+            loader = factory(LoaderConfig())
+        except Exception as exc:
+            raise ConfigurationError(
+                f"dataloader_factory failed for the initial configuration: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        if not isinstance(loader, DataLoader):
+            raise ConfigurationError("dataloader_factory must return a torch DataLoader")
+        if type(loader) is not DataLoader:
+            raise ConfigurationError(
+                "dataloader_factory must return a standard torch.utils.data.DataLoader"
+            )
+        actual = initial_loader_config(loader)
+        if actual != LoaderConfig():
+            raise ConfigurationError(
+                "dataloader_factory must honor the requested LoaderConfig; the initial "
+                f"request was {LoaderConfig().describe()} but the returned loader uses "
+                f"{actual.describe()}"
+            )
+        template = LoaderTemplate.from_dataloader(loader, sample_count_fn=sample_count_fn)
+        info = ReproducibilityInfo(
+            status="factory_managed",
+            managed=("loader", "sampler", "generator", "training_environment", "global_rng"),
+            risks=(),
+            reason=(
+                "The explicit factory is responsible for returning independent loader and "
+                "training objects. APDO manages global RNG isolation around each trial but "
+                "does not inspect objects created inside the factory."
+            ),
+        )
+        return cls(
+            factory=factory,
+            template=template,
+            expected_batches=template.expected_batches(),
+            unbatched=template.unbatched,
+            batch_size=template.batch_size,
+            dataset_size=map_dataset_length(template.dataset),
+            sample_count_fn=sample_count_fn,
+            isolation=info,
+            input_kind="dataloader_factory",
+        )
+
+    def build(self, config: LoaderConfig, *, isolate: bool = True) -> DataLoader:
+        if self.factory is None:
+            if self.template is None:
+                raise ConfigurationError("this loader source has no factory")
+            return self.template.build(config, isolate=isolate)
+        loader = self.factory(config)
+        if type(loader) is not DataLoader:
+            raise ConfigurationError(
+                "dataloader_factory must return a standard torch.utils.data.DataLoader"
+            )
+        actual = initial_loader_config(loader)
+        if actual != config:
+            raise ConfigurationError(
+                f"dataloader_factory returned {actual.describe()} for requested {config.describe()}"
+            )
+        return loader
+
+    def count_samples(self, batch: Any) -> int:
+        return count_batch_samples(batch, unbatched=self.unbatched, fn=self.sample_count_fn)
+
+    def compatibility_warnings(self) -> list[str]:
+        if self.factory is not None:
+            return [
+                "The loader factory contract requires independent mutable loader state for "
+                "every trial; APDO cannot verify objects created inside the factory."
+            ]
+        if self.template is None:
+            return []
+        return compatibility_warnings(self.template)
+
+
+def count_batch_samples(
+    batch: Any,
+    *,
+    unbatched: bool,
+    fn: Callable[[Any], int] | None,
+) -> int:
+    if unbatched:
+        return 1
+    if fn is not None:
+        return _validated_count(fn(batch))
+    counts = _leading_dimensions(batch)
+    if not counts:
+        raise DatasetError(
+            "could not determine the number of samples in a batch; return tensors "
+            "from collate_fn or pass sample_count_fn to optimize()"
+        )
+    if len(set(counts)) != 1:
+        raise DatasetError(
+            "batch fields have inconsistent leading dimensions "
+            f"{sorted(set(counts))}; pass sample_count_fn to optimize()"
+        )
+    return counts[0]
+
+
+def compatibility_warnings(template: LoaderTemplate) -> list[str]:
+    info = template.isolation_info()
+    return list(info.risks)
+
+
+def _isolation_reason(
+    status: str,
+    managed: list[str],
+    risks: list[str],
+) -> str:
+    if status == "verified":
+        return (
+            "Supported loader generator, sampler, batch sampler, and global RNG state are "
+            "isolated for each trial. Undetected mutation inside arbitrary dataset or "
+            "transform code cannot be excluded."
+        )
+    if status == "partial":
+        return (
+            "Supported loader state is isolated, but detected dataset, transform, or "
+            "worker initialization behavior cannot be fully controlled: " + " ".join(risks)
+        )
+    return (
+        "One or more loader-owned objects cannot be reconstructed independently. APDO "
+        "does not claim full reproducibility for this pipeline: " + " ".join(risks)
+    )
+
+
+def _dataset_state_risk(dataset: Any) -> tuple[str | None, bool]:
+    suspects: list[Any] = [dataset]
+    for name in ("transform", "transforms", "generator"):
+        if hasattr(dataset, name):
+            value = getattr(dataset, name)
+            suspects.append(value)
+            nested = getattr(value, "transforms", None)
+            if isinstance(nested, (tuple, list)):
+                suspects.extend(nested)
+    for value in suspects:
+        if isinstance(value, (torch.Generator, random.Random)):
+            return (
+                "The dataset or its transform graph contains an independent random number "
+                "generator that APDO cannot clone. Use dataloader_factory for training mode.",
+                True,
+            )
+        class_name = type(value).__name__.lower()
+        module = type(value).__module__.lower()
+        if module.startswith("numpy.random") and "generator" in class_name:
+            return (
+                "The dataset or its transform graph contains a NumPy random generator "
+                "that APDO cannot clone. Use dataloader_factory for training mode.",
+                True,
+            )
+        if "random" in class_name or "augment" in class_name:
+            return (
+                "The dataset or a transform appears to use randomness. Its internal state "
+                "is not isolated between trials, so comparability may be reduced.",
+                False,
+            )
+    return None, False
+
+
+def _isolated_sampler(sampler: Any, *, clone: bool = True) -> Any:
+    generator = getattr(sampler, "generator", None)
+    cloned_generator = clone_generator(generator) if clone and generator is not None else generator
+    if type(sampler) is SequentialSampler:
+        return SequentialSampler(sampler.data_source)
+    if type(sampler) is RandomSampler:
+        if not clone:
+            return sampler
+        return RandomSampler(
+            sampler.data_source,
+            replacement=sampler.replacement,
+            num_samples=sampler.num_samples,
+            generator=cloned_generator,
+        )
+    if type(sampler) is SubsetRandomSampler:
+        if not clone:
+            return sampler
+        return SubsetRandomSampler(sampler.indices, generator=cloned_generator)
+    if type(sampler) is WeightedRandomSampler:
+        if not clone:
+            return sampler
+        return WeightedRandomSampler(
+            sampler.weights,
+            sampler.num_samples,
+            sampler.replacement,
+            generator=cloned_generator,
+        )
+    return None
+
+
+def _isolated_batch_sampler(batch_sampler: Any, *, clone: bool = True) -> Any:
+    if type(batch_sampler) is not BatchSampler:
+        return None
+    sampler = _isolated_sampler(batch_sampler.sampler, clone=clone)
+    if sampler is None:
+        return None
+    if not clone:
+        return batch_sampler
+    return BatchSampler(
+        sampler,
+        batch_size=batch_sampler.batch_size,
+        drop_last=batch_sampler.drop_last,
+    )
 
 
 def _sampler_length(sampler: Any, name: str) -> int:
@@ -203,62 +503,3 @@ def _leading_dimensions(value: Any) -> list[int]:
             dimensions.extend(_leading_dimensions(item))
         return dimensions
     return []
-
-
-def compatibility_warnings(template: LoaderTemplate) -> list[str]:
-    reasons: list[str] = []
-    if template.batch_sampler is not None:
-        reasons.append(
-            "A custom batch_sampler is reused by reference. Its mutable state, sampler, "
-            "and generator are shared with every benchmarked loader and are not reset."
-        )
-    if template.generator is not None:
-        reasons.append(
-            "The loader generator object is reused by reference. Iterating benchmarked "
-            "loaders advances its state, including the state visible to the original loader."
-        )
-    if _is_random_sampler(template.sampler):
-        reasons.append(
-            "The loader uses a random sampler. APDO does not reset sampler, dataset, or "
-            "global RNG state, so rounds can load different samples."
-        )
-    dataset_reason = _dataset_state_reason(template.dataset)
-    if dataset_reason is not None:
-        reasons.append(dataset_reason)
-    if template.worker_init_fn is not None:
-        reasons.append(
-            "A custom worker_init_fn is reused by reference. APDO does not reset any "
-            "state that it mutates."
-        )
-    return reasons
-
-
-def _is_random_sampler(sampler: Any) -> bool:
-    name = type(sampler).__name__.lower()
-    return "random" in name or "shuffle" in name
-
-
-def _dataset_state_reason(dataset: Any) -> str | None:
-    suspects: list[Any] = [dataset]
-    for name in ("transform", "transforms"):
-        if hasattr(dataset, name):
-            value = getattr(dataset, name)
-            suspects.append(value)
-            nested = getattr(value, "transforms", None)
-            if isinstance(nested, (tuple, list)):
-                suspects.extend(nested)
-    for value in suspects:
-        if isinstance(value, (torch.Generator, random.Random)):
-            return (
-                "The dataset or its transform graph contains a random number generator. "
-                "APDO does not reset dataset or transform RNG state between rounds, so "
-                "comparability may be reduced."
-            )
-        class_name = type(value).__name__.lower()
-        if "random" in class_name or "augment" in class_name:
-            return (
-                "The dataset or a transform appears to use randomness. APDO does not "
-                "reset dataset or transform RNG state between rounds, so comparability "
-                "may be reduced."
-            )
-    return None

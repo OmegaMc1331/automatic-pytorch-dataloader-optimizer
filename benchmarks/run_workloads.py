@@ -7,16 +7,16 @@ from pathlib import Path
 from apdo import optimize
 
 try:
-    from benchmarks.workloads import build_workload
+    from benchmarks.workloads import build_training_step_factory, build_workload
 except ModuleNotFoundError:
-    from workloads import build_workload
+    from workloads import build_training_step_factory, build_workload
 
-WORKLOADS = ("in-memory", "disk-backed", "cpu-heavy")
+WORKLOADS = ("in-memory", "disk-backed", "cpu-heavy", "training")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run the three APDO v0.2.0 workloads and write JSON/HTML reports."
+        description="Run the four APDO v0.3.0 workloads and write JSON/HTML reports."
     )
     parser.add_argument(
         "--workload",
@@ -54,6 +54,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="override the workload batch cap",
     )
     parser.add_argument(
+        "--epochs",
+        type=int,
+        default=3,
+        help="epochs per training trial (default: 3)",
+    )
+    parser.add_argument(
+        "--training-rounds",
+        type=int,
+        default=2,
+        help="measured training finalist rounds (default: 2)",
+    )
+    parser.add_argument(
         "--cache-directory",
         type=Path,
         default=Path("benchmarks/.cache"),
@@ -78,11 +90,21 @@ def main() -> int:
     for name in names:
         dataset, batch_size, workload_batches = build_workload(name, args.cache_directory)
         max_batches = args.max_batches or workload_batches
-        print(f"\n=== {name}: {len(dataset)} samples, batch_size={batch_size} ===", flush=True)
+        training = name == "training"
+        print(
+            f"\n=== {name}: {len(dataset)} samples, batch_size={batch_size}, "
+            f"mode={'training' if training else 'loader'} ===",
+            flush=True,
+        )
         result = optimize(
             dataset,
             batch_size=batch_size,
             device=args.device,
+            mode="training" if training else "loader",
+            epochs=args.epochs if training else 1,
+            training_step_factory=(build_training_step_factory(args.device) if training else None),
+            training_rounds=args.training_rounds,
+            training_validation_rounds=args.validation_rounds,
             max_batches=max_batches,
             rounds=args.rounds,
             validation=True,
@@ -101,14 +123,18 @@ def main() -> int:
         summaries.append(
             {
                 "workload": name,
+                "mode": result.settings.benchmark_mode,
+                "epochs": result.settings.epochs,
                 "samples": len(dataset),
                 "batch_size": batch_size,
-                "batches_per_pass": max_batches,
+                "batches_per_epoch": max_batches,
                 "recommended": result.best_config.describe(),
                 "validation_status": result.validation.status,
                 "validation_improvement_percent": result.validation.improvement_percent,
                 "search_improvement_percent": result.search_improvement_percent,
                 "median_throughput": result.best_summary.median_throughput,
+                "throughput_kind": ("end_to_end_training" if training else "loader"),
+                "baseline_throughput": result.baseline_throughput,
                 "duration_s": result.duration_s,
             }
         )
