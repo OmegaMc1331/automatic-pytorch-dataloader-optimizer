@@ -125,7 +125,7 @@ def make_settings(
         time_budget_s=None,
         initial_config=initial_config or LoaderConfig(),
         input_kind="dataset",
-        protocol_version="3.0",
+        protocol_version="4.0",
         expected_batches=8,
     )
 
@@ -177,6 +177,7 @@ def make_result(
         warnings=warnings,
         selection_reason="Test selection reason.",
         baseline_throughput=80.0,
+        baseline_amortized_throughput=18.0,
         improvement_percent=(validation.improvement_percent if validation.confirmed else 0.0),
         started_at=datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
         duration_s=1.25,

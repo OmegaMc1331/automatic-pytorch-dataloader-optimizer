@@ -10,6 +10,7 @@ from typing import Any
 from apdo._version import __version__
 from apdo.errors import ApdoError
 from apdo.optimizer import optimize
+from apdo.stability import evaluate_stability
 
 
 class _CliError(Exception):
@@ -206,6 +207,42 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum num_workers value to test (default: min(8, available CPUs))",
     )
     benchmark.add_argument(
+        "--timing-profile",
+        choices=("standard", "detailed"),
+        default="standard",
+        help=(
+            "standard: whole-cycle CUDA events; detailed: add transfer and per-step "
+            "device events without per-batch synchronization (default: standard)"
+        ),
+    )
+    benchmark.add_argument(
+        "--selection-metric",
+        choices=("sustained", "amortized"),
+        default="sustained",
+        help=(
+            "sustained: execution throughput excluding first loader batch; "
+            "amortized: all samples divided by complete trial wall (default: sustained)"
+        ),
+    )
+    benchmark.add_argument(
+        "--comparability-policy",
+        choices=("off", "warn", "strict"),
+        default="warn",
+        help=(
+            "off: no comparison diagnostics; warn: report observed mismatches; "
+            "strict: require verified sample identity (default: warn)"
+        ),
+    )
+    benchmark.add_argument(
+        "--sample-fingerprint",
+        metavar="MODULE:FACTORY",
+        default=None,
+        help=(
+            "import path of a factory returning a callable that hashes stable sample "
+            "identifiers for batch comparability"
+        ),
+    )
+    benchmark.add_argument(
         "--json",
         dest="json_path",
         type=Path,
@@ -222,6 +259,85 @@ def build_parser() -> argparse.ArgumentParser:
         help="write the standalone HTML report to PATH",
     )
     benchmark.set_defaults(handler=_run_benchmark, validation=True)
+    stability = subparsers.add_parser(
+        "stability",
+        help="repeat independent optimizations and summarize recommendation stability",
+        description=(
+            "Run the same optimization experiment multiple times with independent "
+            "seeds, retain partial failures, and report recommendation agreement, "
+            "gain uncertainty, throughput spread, and comparability outcomes."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  apdo stability --dataset my_project.data:build_loader --runs 5 "
+            "--json stability.json --html stability.html\n"
+            "  apdo stability --factory my_project.data:make_loader --mode training "
+            "--training-step-factory my_project.train:make_step --runs 3"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    stability_input = stability.add_mutually_exclusive_group(required=True)
+    stability_input.add_argument(
+        "--dataset",
+        metavar="MODULE:FACTORY",
+        help="import path of a zero-argument dataset or DataLoader factory",
+    )
+    stability_input.add_argument(
+        "--factory",
+        metavar="MODULE:FACTORY",
+        help=(
+            "import path of a callable accepting LoaderConfig and returning "
+            "an independent DataLoader"
+        ),
+    )
+    stability.add_argument(
+        "--mode",
+        choices=("loader", "training"),
+        default="loader",
+        help="benchmark DataLoader only or end-to-end training (default: loader)",
+    )
+    stability.add_argument("--epochs", type=_positive_int, default=None)
+    stability.add_argument("--training-step-factory", metavar="MODULE:FACTORY", default=None)
+    stability.add_argument("--training-rounds", type=_at_least_two, default=2)
+    stability.add_argument("--training-validation-rounds", type=_at_least_two, default=None)
+    stability.add_argument("--max-training-candidates", type=_positive_int, default=3)
+    stability.add_argument(
+        "--validation-policy", choices=("minimum", "positive"), default="minimum"
+    )
+    stability.add_argument("--batch-size", type=_positive_int, default=None)
+    stability.add_argument("--device", default="auto")
+    stability.add_argument("--max-ram-gb", type=_positive_float, default=None)
+    stability.add_argument("--warmup-runs", type=_positive_int, default=1)
+    stability.add_argument("--rounds", type=_at_least_two, default=3)
+    stability.add_argument("--validation-rounds", type=_at_least_two, default=5)
+    stability.add_argument("--min-improvement", type=_fraction, default=0.05)
+    stability.add_argument("--max-workers", type=_positive_int, default=None)
+    stability.add_argument("--max-batches", type=_at_least_two, default=100)
+    stability.add_argument("--sample-count-fn", metavar="MODULE:FACTORY", default=None)
+    stability.add_argument("--sample-fingerprint", metavar="MODULE:FACTORY", default=None)
+    stability.add_argument("--timing-profile", choices=("standard", "detailed"), default="standard")
+    stability.add_argument(
+        "--selection-metric", choices=("sustained", "amortized"), default="sustained"
+    )
+    stability.add_argument(
+        "--comparability-policy", choices=("off", "warn", "strict"), default="warn"
+    )
+    stability.add_argument(
+        "--runs",
+        type=_positive_int,
+        default=5,
+        help="independent optimization runs (default: 5)",
+    )
+    stability.add_argument(
+        "--base-seed",
+        type=_nonnegative_int,
+        default=42,
+        help="first seed; later runs use base_seed + run_index (default: 42)",
+    )
+    stability.add_argument("--no-validation", dest="validation", action="store_false")
+    stability.add_argument("--json", dest="json_path", type=Path, default=None, metavar="PATH")
+    stability.add_argument("--html", dest="html_path", type=Path, default=None, metavar="PATH")
+    stability.set_defaults(handler=_run_stability, validation=True)
     return parser
 
 
@@ -252,6 +368,11 @@ def _run_benchmark(args: argparse.Namespace) -> int:
         sample_count_fn = (
             _load_factory(args.sample_count_fn, "sample-count")
             if args.sample_count_fn is not None
+            else None
+        )
+        sample_fingerprint = (
+            _load_factory(args.sample_fingerprint, "sample-fingerprint")
+            if args.sample_fingerprint is not None
             else None
         )
     except _CliError as exc:
@@ -286,6 +407,10 @@ def _run_benchmark(args: argparse.Namespace) -> int:
             min_improvement=args.min_improvement,
             time_budget_s=args.time_budget_s,
             sample_count_fn=sample_count_fn,
+            timing_profile=args.timing_profile,
+            selection_metric=args.selection_metric,
+            comparability_policy=args.comparability_policy,
+            sample_fingerprint_fn=sample_fingerprint,
             progress=progress,
         )
     except (ApdoError, OSError) as exc:
@@ -307,6 +432,88 @@ def _run_benchmark(args: argparse.Namespace) -> int:
         print(f"apdo: could not write report: {exc}", file=sys.stderr)
         return 1
     return 0
+
+
+def _run_stability(args: argparse.Namespace) -> int:
+    try:
+        data = _load_dataset(args.dataset) if args.dataset is not None else None
+        dataloader_factory = (
+            _load_attribute(args.factory, "loader factory") if args.factory is not None else None
+        )
+        training_step_factory = (
+            _load_attribute(args.training_step_factory, "training step factory")
+            if args.training_step_factory is not None
+            else None
+        )
+        sample_count_fn = (
+            _load_factory(args.sample_count_fn, "sample-count")
+            if args.sample_count_fn is not None
+            else None
+        )
+        sample_fingerprint = (
+            _load_factory(args.sample_fingerprint, "sample-fingerprint")
+            if args.sample_fingerprint is not None
+            else None
+        )
+    except _CliError as exc:
+        print(f"apdo: {exc}", file=sys.stderr)
+        return 1
+
+    def progress(message: str) -> None:
+        print(message, file=sys.stderr, flush=True)
+
+    def experiment(seed: int) -> Any:
+        return optimize(
+            data,
+            batch_size=args.batch_size,
+            device=args.device,
+            max_ram_gb=args.max_ram_gb,
+            dataloader_factory=dataloader_factory,
+            mode=args.mode,
+            epochs=args.epochs,
+            training_step_factory=training_step_factory,
+            training_rounds=args.training_rounds,
+            training_validation_rounds=args.training_validation_rounds,
+            max_training_candidates=args.max_training_candidates,
+            validation_policy=args.validation_policy,
+            warmup_runs=args.warmup_runs,
+            repetitions=args.rounds,
+            rounds=None,
+            max_batches=args.max_batches,
+            max_workers=args.max_workers,
+            seed=seed,
+            validation=args.validation,
+            validation_rounds=args.validation_rounds,
+            min_improvement=args.min_improvement,
+            sample_count_fn=sample_count_fn,
+            timing_profile=args.timing_profile,
+            selection_metric=args.selection_metric,
+            comparability_policy=args.comparability_policy,
+            sample_fingerprint_fn=sample_fingerprint,
+            progress=progress,
+        )
+
+    report = evaluate_stability(
+        experiment,
+        runs=args.runs,
+        base_seed=args.base_seed,
+        progress=progress,
+    )
+    print(report.summary_text())
+    for warning in report.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+
+    try:
+        if args.json_path is not None:
+            report.to_json(args.json_path)
+            print(f"JSON stability report written to {args.json_path}")
+        if args.html_path is not None:
+            report.to_html(args.html_path)
+            print(f"HTML stability report written to {args.html_path}")
+    except OSError as exc:
+        print(f"apdo: could not write stability report: {exc}", file=sys.stderr)
+        return 1
+    return 0 if report.summary.runs_succeeded else 1
 
 
 def _load_dataset(specification: str) -> Any:

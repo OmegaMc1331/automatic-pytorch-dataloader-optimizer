@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from apdo import LoaderConfig
+from apdo.comparability import ComparabilityResult
 from apdo.validation import (
     ValidationObservation,
     analyze_validation,
@@ -182,4 +185,131 @@ def test_invalid_validation_policy_is_rejected() -> None:
             min_improvement=0.05,
             seed=17,
             policy="strict",
+        )
+
+
+def _amortized_observations(gains: tuple[float, ...]) -> tuple[ValidationObservation, ...]:
+    return tuple(
+        ValidationObservation(
+            round_index=index,
+            baseline=replace(make_pass_metrics(100.0), amortized_throughput=10.0),
+            candidate=replace(
+                make_pass_metrics(100.0 * (1.0 + gain)),
+                amortized_throughput=10.0 * (1.0 + gain),
+            ),
+        )
+        for index, gain in enumerate(gains)
+    )
+
+
+def test_selection_metric_changes_validation_gain() -> None:
+    sustained = analyze_validation(
+        BASELINE,
+        CANDIDATE,
+        observations(0.0, 0.0, 0.0),
+        enabled=True,
+        min_improvement=0.05,
+        seed=17,
+        selection_metric="sustained",
+    )
+    amortized = analyze_validation(
+        BASELINE,
+        CANDIDATE,
+        _amortized_observations((0.10, 0.10, 0.10)),
+        enabled=True,
+        min_improvement=0.05,
+        seed=17,
+        selection_metric="amortized",
+    )
+
+    assert sustained.status == "inconclusive"
+    assert amortized.status == "confirmed"
+    assert amortized.selection_metric == "amortized"
+    assert amortized.to_dict()["selection_metric"] == "amortized"
+    assert amortized.to_dict()["observations"][0]["gain_amortized_percent"] == pytest.approx(10.0)
+
+
+def test_strict_comparability_blocks_unverified_confirmation() -> None:
+    unknown = ComparabilityResult(
+        status="unknown",
+        structural_verified=True,
+        sample_identity_verified=False,
+        rounds_compared=3,
+        rounds_with_fingerprints=0,
+        structural_mismatch_rounds=0,
+        different_sample_rounds=0,
+        notes=("no fingerprints",),
+    )
+    warn = analyze_validation(
+        BASELINE,
+        CANDIDATE,
+        observations(0.10, 0.10, 0.10),
+        enabled=True,
+        min_improvement=0.05,
+        seed=17,
+        comparability=unknown,
+        comparability_policy="warn",
+    )
+    strict = analyze_validation(
+        BASELINE,
+        CANDIDATE,
+        observations(0.10, 0.10, 0.10),
+        enabled=True,
+        min_improvement=0.05,
+        seed=17,
+        comparability=unknown,
+        comparability_policy="strict",
+    )
+
+    assert warn.status == "confirmed"
+    assert strict.status == "not_possible"
+    assert strict.to_dict()["comparability_policy"] == "strict"
+    assert strict.to_dict()["comparability"]["sufficient_for_strict"] is False
+
+
+def test_observed_comparability_problem_blocks_confirmation() -> None:
+    different = ComparabilityResult(
+        status="different_samples",
+        structural_verified=True,
+        sample_identity_verified=False,
+        rounds_compared=3,
+        rounds_with_fingerprints=3,
+        structural_mismatch_rounds=0,
+        different_sample_rounds=3,
+    )
+    result = analyze_validation(
+        BASELINE,
+        CANDIDATE,
+        observations(0.10, 0.10, 0.10),
+        enabled=True,
+        min_improvement=0.05,
+        seed=17,
+        comparability=different,
+        comparability_policy="warn",
+    )
+
+    assert result.status == "not_possible"
+    assert "comparability" in result.reason
+
+
+def test_invalid_selection_and_comparability_policies_are_rejected() -> None:
+    with pytest.raises(ValueError, match="selection metric"):
+        analyze_validation(
+            BASELINE,
+            CANDIDATE,
+            observations(0.1, 0.1),
+            enabled=True,
+            min_improvement=0.05,
+            seed=17,
+            selection_metric="fastest",
+        )
+    with pytest.raises(ValueError, match="comparability policy"):
+        analyze_validation(
+            BASELINE,
+            CANDIDATE,
+            observations(0.1, 0.1),
+            enabled=True,
+            min_improvement=0.05,
+            seed=17,
+            comparability_policy="maybe",
         )

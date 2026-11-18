@@ -48,13 +48,17 @@ def test_benchmark_help() -> None:
     assert "--epochs" in completed.stdout
     assert "--training-step-factory" in completed.stdout
     assert "--validation-policy" in completed.stdout
+    assert "--timing-profile" in completed.stdout
+    assert "--selection-metric" in completed.stdout
+    assert "--comparability-policy" in completed.stdout
+    assert "--sample-fingerprint" in completed.stdout
 
 
 def test_version() -> None:
     completed = run_cli("--version")
 
     assert completed.returncode == 0
-    assert "apdo 0.3.0" in completed.stdout
+    assert "apdo 0.4.0" in completed.stdout
 
 
 def test_no_command_prints_help() -> None:
@@ -201,3 +205,61 @@ def test_training_benchmark_with_factory(tmp_path: Path) -> None:
     assert payload["search"]["throughput_kind"] == "end_to_end_training"
     assert payload["training"]["epochs"] == 1
     assert payload["reproducibility"]["status"] == "factory_managed"
+
+
+def test_stability_help() -> None:
+    completed = run_cli("stability", "--help")
+
+    assert completed.returncode == 0
+    assert "stability" in completed.stdout
+    assert "--runs" in completed.stdout
+    assert "--base-seed" in completed.stdout
+    assert "--comparability-policy" in completed.stdout
+    assert "--json" in completed.stdout
+    assert "--html" in completed.stdout
+
+
+def test_stability_end_to_end(tmp_path: Path) -> None:
+    json_path = tmp_path / "stability.json"
+    html_path = tmp_path / "stability.html"
+
+    completed = run_cli(
+        "stability",
+        "--dataset",
+        "examples.synthetic_dataset:create_dataset",
+        "--batch-size",
+        "16",
+        "--device",
+        "cpu",
+        "--max-batches",
+        "2",
+        "--rounds",
+        "2",
+        "--validation-rounds",
+        "2",
+        "--no-validation",
+        "--max-workers",
+        "1",
+        "--runs",
+        "2",
+        "--base-seed",
+        "11",
+        "--json",
+        str(json_path),
+        "--html",
+        str(html_path),
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "Recommendation stability" in completed.stdout
+    assert json_path.is_file()
+    assert html_path.is_file()
+
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 1
+    assert payload["report_kind"] == "stability"
+    assert payload["base_seed"] == 11
+    assert len(payload["runs"]) == 2
+    assert payload["summary"]["runs_total"] == 2
+    assert payload["summary"]["runs_succeeded"] >= 1
+    assert html_path.read_text(encoding="utf-8").startswith("<!DOCTYPE html>")

@@ -17,10 +17,13 @@ from apdo.benchmark import (
     benchmark_rounds,
     benchmark_source,
 )
+from apdo.comparability import compare_measurements, validate_comparability_policy
 from apdo.config import (
     BENCHMARK_MODES,
     BENCHMARK_PROTOCOL_VERSION,
     MAX_BENCHMARK_EPOCHS,
+    SELECTION_METRICS,
+    TIMING_PROFILES,
     VALIDATION_POLICIES,
     BenchmarkSettings,
     LoaderConfig,
@@ -82,6 +85,10 @@ def optimize(
     training_validation_rounds: int | None = None,
     max_training_candidates: int = DEFAULT_MAX_TRAINING_CANDIDATES,
     validation_policy: str = "minimum",
+    timing_profile: str = "standard",
+    selection_metric: str = "sustained",
+    comparability_policy: str = "warn",
+    sample_fingerprint_fn: Callable[[Any], Any] | None = None,
     warmup_runs: int = 1,
     repetitions: int = DEFAULT_ROUNDS,
     rounds: int | None = None,
@@ -128,6 +135,13 @@ def optimize(
         raise ConfigurationError(f"mode must be one of {BENCHMARK_MODES}")
     if validation_policy not in VALIDATION_POLICIES:
         raise ConfigurationError(f"validation_policy must be one of {VALIDATION_POLICIES}")
+    if timing_profile not in TIMING_PROFILES:
+        raise ConfigurationError(f"timing_profile must be one of {TIMING_PROFILES}")
+    if selection_metric not in SELECTION_METRICS:
+        raise ConfigurationError(f"selection_metric must be one of {SELECTION_METRICS}")
+    validate_comparability_policy(comparability_policy)
+    if sample_fingerprint_fn is not None and not callable(sample_fingerprint_fn):
+        raise ConfigurationError("sample_fingerprint_fn must be callable or None")
     resolved_epochs = (
         (DEFAULT_TRAINING_EPOCHS if mode == "training" else 1)
         if epochs is None
@@ -218,6 +232,10 @@ def optimize(
         max_training_candidates=max_training_candidates,
         validation_policy=validation_policy,
         reproducibility_status=source.isolation.status,
+        timing_profile=timing_profile,
+        selection_metric=selection_metric,
+        comparability_policy=comparability_policy,
+        sample_fingerprint=sample_fingerprint_fn is not None,
     )
 
     warnings = _initial_warnings(
@@ -233,6 +251,21 @@ def optimize(
         mode=mode,
         epochs=resolved_epochs,
     )
+    if timing_profile == "detailed":
+        warnings.append(
+            "Detailed timing adds CUDA-event instrumentation around every transfer and "
+            "training step; the extra event records can alter very short-step timings."
+        )
+    if selection_metric == "amortized":
+        warnings.append(
+            "Selection uses total-trial amortized throughput, including loader construction, "
+            "worker startup, epoch transitions, and cleanup."
+        )
+    if comparability_policy == "strict" and sample_fingerprint_fn is None:
+        warnings.append(
+            "Strict comparability requires a sample_fingerprint_fn; without one, sample "
+            "identity cannot be verified and a search candidate will not be confirmed."
+        )
     if rounds is not None and repetitions != DEFAULT_ROUNDS:
         warnings.append(
             "Both rounds and repetitions were provided; rounds takes precedence for the "
@@ -260,6 +293,9 @@ def optimize(
         stage_number=1,
         stage_total=stage_total,
         epochs=search_epochs,
+        timing_profile=timing_profile,
+        comparability_policy=comparability_policy,
+        fingerprint_fn=sample_fingerprint_fn,
     )
     measurements = list(stage_one_result.measurements)
     orders = list(stage_one_result.orders)
@@ -326,6 +362,9 @@ def optimize(
             stage_number=2,
             stage_total=stage_total,
             epochs=search_epochs,
+            timing_profile=timing_profile,
+            comparability_policy=comparability_policy,
+            fingerprint_fn=sample_fingerprint_fn,
         )
         measurements.extend(stage_two_result.measurements)
         orders.extend(stage_two_result.orders)
@@ -336,7 +375,7 @@ def optimize(
         _emit(progress, "Stage 2: no additional multi-worker configurations to test")
 
     _emit(progress, "Selecting a loader search recommendation")
-    loader_selection = _select_configuration(measurements)
+    loader_selection = _select_configuration(measurements, selection_metric)
     selection = loader_selection
     if mode == "training":
         baseline = _measurement_for_config(measurements, initial_config)
@@ -362,6 +401,9 @@ def optimize(
             stage_total=stage_total,
             epochs=resolved_epochs,
             training_step_factory=training_step_factory,
+            timing_profile=timing_profile,
+            comparability_policy=comparability_policy,
+            fingerprint_fn=sample_fingerprint_fn,
         )
         measurements.extend(training_result.measurements)
         orders.extend(training_result.orders)
@@ -377,7 +419,7 @@ def optimize(
                 "The initial configuration did not complete a successful training "
                 "measurement, so APDO cannot establish a safe fallback.\n" + detail
             )
-        selection = _select_configuration(training_successes)
+        selection = _select_configuration(training_successes, selection_metric)
         if training_result.budget_exhausted:
             warnings.append(
                 "The time budget stopped training finalists before all planned rounds completed."
@@ -389,8 +431,10 @@ def optimize(
 
     baseline_summary = _summary(baseline)
     selected_summary = _summary(selection.selected)
+    baseline_value = _metric_value(baseline_summary, selection_metric)
+    selected_value = _metric_value(selected_summary, selection_metric)
     search_improvement = (
-        selected_summary.median_throughput / baseline_summary.median_throughput - 1.0
+        selected_value / baseline_value - 1.0 if baseline_value > 0 else 0.0
     ) * 100.0
 
     failures = [item for item in measurements if not item.succeeded]
@@ -432,10 +476,23 @@ def optimize(
         epochs=resolved_epochs,
         training_step_factory=training_step_factory,
         validation_policy=validation_policy,
+        timing_profile=timing_profile,
+        selection_metric=selection_metric,
+        comparability_policy=comparability_policy,
+        fingerprint_fn=sample_fingerprint_fn,
     )
     orders.extend(validation_orders)
     budget_exhausted = budget_exhausted or validation_budget
     warnings.extend(validation_result.failures)
+    if validation_result.comparability is not None:
+        comparison = validation_result.comparability
+        if comparison.has_observed_problem or (
+            comparability_policy == "strict" and not comparison.sufficient_for_strict
+        ):
+            warnings.append(
+                "Comparability diagnostics did not establish sufficient data identity; "
+                f"{comparison.summary}"
+            )
     if budget_exhausted:
         warnings.append(
             "The configured time budget was exhausted; some planned measurements were "
@@ -474,6 +531,7 @@ def optimize(
         warnings=tuple(dict.fromkeys(warnings)),
         selection_reason=selection_reason,
         baseline_throughput=baseline_summary.median_throughput,
+        baseline_amortized_throughput=baseline_summary.median_amortized_throughput,
         improvement_percent=final_improvement,
         started_at=started_at,
         duration_s=duration_s,
@@ -711,6 +769,9 @@ def _run_stage(
     stage_total: int,
     epochs: int = 1,
     training_step_factory: TrainingStepFactory | None = None,
+    timing_profile: str = "standard",
+    comparability_policy: str = "warn",
+    fingerprint_fn: Callable[[Any], Any] | None = None,
 ) -> StageResult:
     _emit(
         progress,
@@ -731,6 +792,9 @@ def _run_stage(
         progress=progress,
         epochs=epochs,
         training_step_factory=training_step_factory,
+        timing_profile=timing_profile,
+        fingerprint_fn=fingerprint_fn,
+        collect_comparability=comparability_policy != "off",
     )
     for measurement in result.measurements:
         if measurement.succeeded:
@@ -770,6 +834,10 @@ def _run_validation(
     epochs: int = 1,
     training_step_factory: TrainingStepFactory | None = None,
     validation_policy: str = "minimum",
+    timing_profile: str = "standard",
+    selection_metric: str = "sustained",
+    comparability_policy: str = "warn",
+    fingerprint_fn: Callable[[Any], Any] | None = None,
 ) -> tuple[ValidationResult, tuple[RoundOrder, ...], bool]:
     if candidate_config == baseline_config:
         result = analyze_validation(
@@ -780,6 +848,7 @@ def _run_validation(
             min_improvement=min_improvement,
             seed=seed,
             policy=validation_policy,
+            selection_metric=selection_metric,
         )
         return result, (), False
     if not enabled:
@@ -791,6 +860,7 @@ def _run_validation(
             min_improvement=min_improvement,
             seed=seed,
             policy=validation_policy,
+            selection_metric=selection_metric,
         )
         return result, (), False
     if deadline is not None and time.perf_counter() >= deadline:
@@ -803,6 +873,7 @@ def _run_validation(
             seed=seed,
             failures=("Independent validation was skipped because the time budget expired.",),
             policy=validation_policy,
+            selection_metric=selection_metric,
         )
         return result, (), True
     legacy_template = template if source is None else None
@@ -830,6 +901,9 @@ def _run_validation(
             deadline=deadline,
             progress=progress,
             epochs=epochs,
+            timing_profile=timing_profile,
+            fingerprint_fn=fingerprint_fn,
+            collect_comparability=comparability_policy != "off",
         )
     else:
         stage = benchmark_source(
@@ -846,6 +920,9 @@ def _run_validation(
             progress=progress,
             epochs=epochs,
             training_step_factory=training_step_factory,
+            timing_profile=timing_profile,
+            fingerprint_fn=fingerprint_fn,
+            collect_comparability=comparability_policy != "off",
         )
     by_config = {item.config: item for item in stage.measurements}
     baseline_measurement = by_config[baseline_config]
@@ -877,6 +954,11 @@ def _run_validation(
     if stage.budget_exhausted:
         observations = []
 
+    comparison = (
+        compare_measurements(baseline_measurement, candidate_measurement)
+        if comparability_policy != "off"
+        else None
+    )
     result = analyze_validation(
         baseline_config,
         candidate_config,
@@ -886,6 +968,9 @@ def _run_validation(
         seed=seed,
         failures=failure_messages,
         policy=validation_policy,
+        selection_metric=selection_metric,
+        comparability=comparison,
+        comparability_policy=comparability_policy,
     )
     return result, stage.orders, stage.budget_exhausted
 
@@ -943,35 +1028,45 @@ def _finalist_workers(measurements: Sequence[ConfigMeasurement]) -> list[int]:
 
 def _select_configuration(
     measurements: Sequence[ConfigMeasurement],
+    selection_metric: str = "sustained",
 ) -> _Selection:
     successful = [item for item in measurements if item.succeeded and item.summary]
     if not successful:
         raise BenchmarkError("no successful configuration is available for selection")
+    if selection_metric not in SELECTION_METRICS:
+        raise ConfigurationError(f"selection_metric must be one of {SELECTION_METRICS}")
 
     fastest = max(
         successful,
-        key=lambda item: _summary(item).median_throughput,
+        key=lambda item: _metric_value(_summary(item), selection_metric),
     )
     fastest_summary = _summary(fastest)
+    fastest_value = _metric_value(fastest_summary, selection_metric)
+    fastest_low, fastest_high = _metric_interval(fastest_summary, selection_metric)
     equivalent = [
         item
         for item in successful
-        if _summary(item).median_throughput >= fastest_summary.median_throughput * MATERIAL_BAND
-        and _summary(item).ci_low_throughput <= fastest_summary.ci_high_throughput
-        and fastest_summary.ci_low_throughput <= _summary(item).ci_high_throughput
+        if _metric_value(_summary(item), selection_metric) >= fastest_value * MATERIAL_BAND
+        and _metric_interval(_summary(item), selection_metric)[0] <= fastest_high
+        and fastest_low <= _metric_interval(_summary(item), selection_metric)[1]
     ]
     selected = min(equivalent, key=lambda item: item.config.simplicity_key())
 
+    metric_label = (
+        "median total-trial amortized throughput"
+        if selection_metric == "amortized"
+        else "median sustained throughput"
+    )
     if selected.config == fastest.config:
         reason = (
             "The fastest measured search configuration was selected. No simpler "
-            "configuration was both within 5% of its median throughput and had a 95% "
+            f"configuration was both within 5% of its {metric_label} and had a 95% "
             "bootstrap confidence interval that overlapped the fastest interval."
         )
     else:
         reason = (
             f"The fastest measured configuration was {fastest.config.describe()}. "
-            f"{selected.config.describe()} was within 5% of its median throughput and "
+            f"{selected.config.describe()} was within 5% of its {metric_label} and "
             "had a 95% bootstrap confidence interval that overlapped the fastest "
             "interval, so the simpler configuration was preferred."
         )
@@ -981,6 +1076,26 @@ def _select_configuration(
         equivalent=tuple(equivalent),
         reason=reason,
     )
+
+
+def _metric_value(summary: MetricsSummary, selection_metric: str) -> float:
+    if selection_metric == "amortized":
+        return summary.median_amortized_throughput or 0.0
+    return summary.median_throughput
+
+
+def _metric_interval(
+    summary: MetricsSummary,
+    selection_metric: str,
+) -> tuple[float, float]:
+    if selection_metric == "amortized" and summary.ci_low_amortized_throughput is not None:
+        return (
+            summary.ci_low_amortized_throughput,
+            summary.ci_high_amortized_throughput
+            if summary.ci_high_amortized_throughput is not None
+            else summary.ci_low_amortized_throughput,
+        )
+    return summary.ci_low_throughput, summary.ci_high_throughput
 
 
 def _final_reason(

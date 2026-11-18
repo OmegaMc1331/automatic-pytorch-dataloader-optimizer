@@ -16,3 +16,7 @@ class BenchmarkError(ApdoError, RuntimeError):
 
 class MemoryLimitExceeded(BenchmarkError):
     pass
+
+
+class FingerprintError(ApdoError, ValueError):
+    pass

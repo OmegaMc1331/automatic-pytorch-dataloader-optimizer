@@ -1,11 +1,20 @@
 from apdo._version import __version__
 from apdo.benchmark import ConfigMeasurement, CycleMetrics, RoundMeasurement
-from apdo.config import BENCHMARK_PROTOCOL_VERSION, BenchmarkSettings, LoaderConfig
+from apdo.comparability import BatchObservations, ComparabilityResult, compare_measurements
+from apdo.config import (
+    BENCHMARK_PROTOCOL_VERSION,
+    COMPARABILITY_POLICIES,
+    SELECTION_METRICS,
+    TIMING_PROFILES,
+    BenchmarkSettings,
+    LoaderConfig,
+)
 from apdo.errors import (
     ApdoError,
     BenchmarkError,
     ConfigurationError,
     DatasetError,
+    FingerprintError,
     MemoryLimitExceeded,
 )
 from apdo.isolation import ReproducibilityInfo
@@ -15,6 +24,7 @@ from apdo.optimizer import optimize
 from apdo.order import RoundOrder
 from apdo.report import OptimizationResult
 from apdo.resources import EnvironmentInfo, GpuInfo
+from apdo.stability import StabilityReport, StabilityRun, StabilitySummary, evaluate_stability
 from apdo.training import TrainingStepFactory
 from apdo.validation import (
     VALIDATION_STATUSES,
@@ -28,10 +38,14 @@ __all__ = [
     "ApdoError",
     "BenchmarkError",
     "BenchmarkSettings",
+    "BatchObservations",
+    "COMPARABILITY_POLICIES",
+    "ComparabilityResult",
     "ConfigMeasurement",
     "ConfigurationError",
     "CycleMetrics",
     "DatasetError",
+    "FingerprintError",
     "EnvironmentInfo",
     "GpuInfo",
     "LoaderConfig",
@@ -44,9 +58,16 @@ __all__ = [
     "RoundMeasurement",
     "ReproducibilityInfo",
     "RoundOrder",
+    "SELECTION_METRICS",
+    "TIMING_PROFILES",
     "TrainingStepFactory",
     "ValidationObservation",
     "ValidationResult",
+    "StabilityReport",
+    "StabilityRun",
+    "StabilitySummary",
     "__version__",
+    "compare_measurements",
+    "evaluate_stability",
     "optimize",
 ]

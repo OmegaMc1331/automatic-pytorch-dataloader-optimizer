@@ -16,10 +16,14 @@ DataLoader throughput depends on the dataset, storage, preprocessing cost, CPU t
 
 APDO runs the real loader, records repeated measurements, validates the search recommendation with fresh measurements, and retains the initial configuration when a gain is not confirmed. It does not estimate performance from hardware specifications and does not call a cloud service.
 
-## Features in v0.3.0
+## Features in v0.4.0
 
 - Optimizes a map-style dataset with a batch size, an existing `DataLoader`, or a config-aware loader factory.
-- Measures repeated epochs in one trial and reports worker startup, epoch transitions, steady-state throughput, and full or partial epochs separately.
+- Measures repeated epochs in one trial and reports iterator initialization, first-batch acquisition, worker shutdown, loader cleanup, epoch transitions, sustained throughput, and total trial wall separately.
+- Supports a detailed timing profile with CUDA Events around transfers and training steps without per-batch synchronization.
+- Supports an explicit amortized metric that divides all trial samples by the complete trial wall, including construction, startup, transitions, shutdown, and cleanup.
+- Records batch structure and optional sample fingerprints for paired comparability diagnostics under `off`, `warn`, or `strict` policies.
+- Provides repeated independent optimizations through `evaluate_stability` and `apdo stability`, retaining partial failures and summarizing recommendation agreement.
 - Supports end-to-end training mode with a user-supplied training-step factory covering forward, backward, and optimizer work.
 - Preserves the original loader's dataset, batch size, sampler, batch sampler, collate function, `drop_last`, timeout, worker initialization, generator, multiprocessing context, and `in_order` setting.
 - Changes only `num_workers`, `pin_memory`, `prefetch_factor`, and `persistent_workers`.
@@ -29,15 +33,15 @@ APDO runs the real loader, records repeated measurements, validates the search r
 - Runs independent paired validation with a configurable `minimum` or `positive` policy instead of treating the search result as proof.
 - Falls back to the initial configuration unless validation confirms the required minimum gain.
 - Supports optional time budgets and custom sample counting for unusual collate functions.
-- Generates a schema-v3 JSON report and a self-contained HTML report with cycles, training metrics, reproducibility, validation, ranking, execution order, environment, method, and limitations.
-- Provides four deterministic local workloads, including a real training workload, without adding slow benchmarks to CI.
+- Generates a schema-v4 JSON report and a self-contained HTML report with lifecycle timing, comparability, training metrics, reproducibility, validation, ranking, execution order, environment, method, and limitations.
+- Provides six deterministic local workloads, including startup-bound, compute-bound, and real training workloads, without adding slow benchmarks to CI.
 
 ## Installation
 
-v0.3.0 is distributed through GitHub Releases. PyPI publication is not part of this release.
+v0.4.0 is distributed through GitHub Releases. PyPI publication is not part of this release.
 
 ```bash
-pip install "git+https://github.com/OmegaMc1331/automatic-pytorch-dataloader-optimizer.git@v0.3.0"
+pip install "git+https://github.com/OmegaMc1331/automatic-pytorch-dataloader-optimizer.git@v0.4.0"
 ```
 
 For development from a clone:
@@ -139,8 +143,6 @@ def create_training_step():
 
     def step(batch):
         features, labels = batch
-        features = features.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         loss = loss_fn(model(features), labels)
         loss.backward()
@@ -221,7 +223,7 @@ Only `num_workers`, `pin_memory`, `prefetch_factor`, and `persistent_workers` va
 3. Loader search stage 2 varies `prefetch_factor` and `persistent_workers` for the two best multi-worker counts.
 4. In training mode, stage 1 and stage 2 measure data loading with one epoch. The initial configuration, the fastest loader configuration, and the highest-ranked alternatives then run the user's training step for the requested number of epochs.
 5. Configurations are measured in seeded, balanced rounds. A discarded warmup round is followed by one measured pass per configuration per round. The executed order is recorded.
-6. Multi-epoch passes warm the first epoch and report sustained throughput from later epochs. Single-epoch loader mode preserves the legacy steady-state calculation. Throughput excludes worker teardown, just as it excludes startup before the first batch.
+6. Every cycle records iterator initialization, first-batch acquisition, execution, and worker shutdown; the complete trial wall also includes loader construction and final cleanup. Sustained throughput excludes the first loader batch, while the amortized metric uses total samples divided by the complete trial wall.
 7. Training mode ranks candidates by sustained end-to-end training throughput. The search recommendation is not based on loader-only throughput.
 8. The initial and selected configurations are measured again in balanced paired rounds. Search measurements are not reused.
 9. A paired bootstrap interval of relative gains determines the validation status under the selected policy.
@@ -258,6 +260,10 @@ Only `num_workers`, `pin_memory`, `prefetch_factor`, and `persistent_workers` va
 | `training_validation_rounds` | `validation_rounds` | Paired validation rounds in training mode. |
 | `max_training_candidates` | `3` | Maximum configurations promoted to the training stage. |
 | `validation_policy` | `"minimum"` | `"minimum"` or `"positive"`. |
+| `timing_profile` | `"standard"` | `"standard"` whole-cycle CUDA events or `"detailed"` transfer/step device events. |
+| `selection_metric` | `"sustained"` | `"sustained"` execution throughput or `"amortized"` total-trial throughput. |
+| `comparability_policy` | `"warn"` | `"off"`, `"warn"`, or `"strict"` batch/sample comparison policy. |
+| `sample_fingerprint_fn` | `None` | Callable returning stable scalar or collection sample identifiers for comparability. |
 | `warmup_runs` | `1` | Discarded warmup rounds per configuration. Must be at least 1. |
 | `repetitions` | `3` | Legacy number of measured search rounds. |
 | `rounds` | `None` | Measured balanced search rounds; overrides `repetitions`. |
@@ -318,6 +324,10 @@ Useful options:
 
 - `--mode loader|training`
 - `--epochs N`
+- `--timing-profile standard|detailed`
+- `--selection-metric sustained|amortized`
+- `--comparability-policy off|warn|strict`
+- `--sample-fingerprint MODULE:FACTORY`
 - `--training-step-factory MODULE:FACTORY`
 - `--training-rounds N`
 - `--training-validation-rounds N`
@@ -338,16 +348,18 @@ Useful options:
 
 ## Reports
 
-JSON reports use schema version 3 and include:
+JSON reports use schema version 4 and include:
 
-- APDO version, start time, duration, protocol version, benchmark mode, epochs, seed, rounds, budget state, and executed search/validation orders.
+- APDO version, start time, duration, protocol version, benchmark mode, epochs, seed, rounds, timing profile, selection metric, comparability policy, budget state, and executed search/validation orders.
+- Lifecycle timing for construction, iterator initialization, first batch, worker shutdown, loader cleanup, total trial wall, sustained throughput, and amortized throughput.
+- Batch structure and optional sample-fingerprint comparability results.
 - Environment, benchmark settings, loader preservation details, reproducibility status and risks, method, and limitations.
 - Baseline, search recommendation, fastest configuration, final recommendation, validation status, policy, and final gain.
 - Per-configuration per-round metrics, per-epoch cycle metrics, aggregate summaries, and failures.
 - Training details with end-to-end throughput, step latency, data wait, transfer time, and selected configuration summaries.
 - Complete validation observations and bootstrap results.
 
-HTML reports are self-contained, contain no remote assets, escape benchmark data, and include dedicated recommendation-validation, training, and reproducibility sections.
+HTML reports are self-contained, contain no remote assets, escape benchmark data, and include dedicated recommendation-validation, comparability, timing-breakdown, training, and reproducibility sections.
 
 ## When the candidate is not confirmed
 
@@ -361,11 +373,13 @@ if result.validation.status != "confirmed":
 
 ## Benchmark workloads
 
-The repository includes four deterministic local workloads designed for tuning sessions rather than CI:
+The repository includes six deterministic local workloads designed for tuning sessions rather than CI:
 
 - `in-memory`: preloaded tensor features with light preprocessing.
 - `disk-backed`: generated local binary records with deterministic random access.
 - `cpu-heavy`: per-sample matrix operations that make worker parallelism visible.
+- `startup-bound`: trivial per-sample work so loader construction and worker startup dominate.
+- `compute-bound`: repeated matrix transforms that make CPU parallelism visible.
 - `training`: a real MLP forward pass, cross-entropy loss, backward pass, and optimizer step.
 
 Run all workloads:
@@ -414,6 +428,7 @@ python -m twine check dist/*
 
 - v0.1.0 and v0.2.0 calls to `optimize(dataset, batch_size=...)` remain supported.
 - v0.3.0 adds training mode, loader factories, multi-epoch metrics, reproducibility reporting, and JSON schema version 3 with protocol version 3.0.
+- v0.4.0 adds explicit lifecycle timing, amortized selection, detailed CUDA timing, batch comparability diagnostics, stability reports, and JSON schema version 4 with protocol version 4.0.
 - The two-stage search, bootstrap selection, memory guard, CUDA transfer measurement, CLI, and reports remain available.
 - Only map-style datasets with `__len__` and `__getitem__` are supported.
 - Loader mode measures data loading; it does not measure model training. Training mode measures the user-supplied model step, so model architecture and device work affect the result.
@@ -424,3 +439,40 @@ python -m twine check dist/*
 - macOS is not covered by CI in this release.
 
 See `CHANGELOG.md` for release history. Licensed under MIT.
+
+## Stability analysis
+
+Run the same optimization repeatedly with independent seeds:
+
+```python
+from apdo import evaluate_stability, optimize
+
+report = evaluate_stability(
+    lambda seed: optimize(
+        dataset,
+        batch_size=32,
+        device="cpu",
+        rounds=3,
+        validation_rounds=5,
+        seed=seed,
+    ),
+    runs=5,
+    base_seed=42,
+)
+print(report.summary_text())
+report.to_json("stability.json")
+report.to_html("stability.html")
+```
+
+The stability report records each run's recommended configuration, validation status, gain, throughput, comparability status, and any failure. It summarizes coverage, recommendation agreement, best-configuration frequency, median gain with a bootstrap interval, throughput spread, and failure counts. Raw batch values are never stored.
+
+CLI equivalent:
+
+```bash
+apdo stability \
+  --dataset my_project.data:build_dataset \
+  --runs 5 \
+  --base-seed 42 \
+  --json stability.json \
+  --html stability.html
+```

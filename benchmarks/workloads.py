@@ -55,6 +55,19 @@ class DiskBackedDataset(Dataset):
         return features, torch.tensor(label, dtype=torch.long)
 
 
+class StartupBoundDataset(Dataset):
+    def __init__(self, size: int = 4096, feature_dim: int = 8) -> None:
+        generator = torch.Generator().manual_seed(2029)
+        self.features = torch.randn(size, feature_dim, generator=generator)
+        self.labels = torch.randint(0, 10, (size,), generator=generator)
+
+    def __len__(self) -> int:
+        return len(self.labels)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.features[index], self.labels[index]
+
+
 class CpuHeavyDataset(Dataset):
     def __init__(self, size: int = 1024, feature_dim: int = 128) -> None:
         generator = torch.Generator().manual_seed(2028)
@@ -137,6 +150,28 @@ def build_training_step_factory(
     return factory
 
 
+class ComputeBoundDataset(Dataset):
+    def __init__(self, size: int = 512, feature_dim: int = 128) -> None:
+        generator = torch.Generator().manual_seed(2030)
+        self.features = torch.randn(size, feature_dim, generator=generator)
+        self.labels = torch.randint(0, 10, (size,), generator=generator)
+        self.matrices = tuple(
+            torch.randn(feature_dim, feature_dim, generator=generator) / feature_dim**0.5
+            for _ in range(3)
+        )
+
+    def __len__(self) -> int:
+        return len(self.labels)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        features = self.features[index]
+        for matrix in self.matrices:
+            features = torch.matmul(features, matrix)
+            features = torch.tanh(features)
+            features = features / (1.0 + features.abs())
+        return features, self.labels[index]
+
+
 def build_workload(
     name: str,
     cache_directory: Path,
@@ -148,8 +183,13 @@ def build_workload(
         return DiskBackedDataset(path, size=2048, feature_dim=128), 32, 40
     if name == "cpu-heavy":
         return CpuHeavyDataset(), 32, 20
+    if name == "startup-bound":
+        return StartupBoundDataset(), 32, 80
+    if name == "compute-bound":
+        return ComputeBoundDataset(), 16, 12
     if name == "training":
         return InMemoryDataset(), 32, 20
     raise ValueError(
-        f"unknown workload {name!r}; expected in-memory, disk-backed, cpu-heavy, or training"
+        f"unknown workload {name!r}; expected in-memory, disk-backed, cpu-heavy, "
+        "startup-bound, compute-bound, or training"
     )

@@ -2,6 +2,40 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.0] - 2026-11-18
+
+### Added
+
+- Explicit lifecycle timing for loader construction, iterator initialization, first-batch acquisition, worker shutdown, loader cleanup, and complete trial wall.
+- `sustained` (default) and `amortized` selection metrics. Amortized throughput divides all samples in a trial by the complete trial wall.
+- `standard` and `detailed` timing profiles. Standard uses whole-cycle CUDA Events; detailed adds transfer and per-step device events without per-batch synchronization.
+- Batch structure and optional sample-fingerprint comparability diagnostics with `off`, `warn`, and `strict` policies.
+- `evaluate_stability` API and `apdo stability` CLI command for repeated independent optimizations with partial-failure retention, recommendation agreement, gain intervals, throughput spread, and failure coverage.
+- JSON schema version 4 and benchmark protocol version 4.0 with lifecycle, timing, and comparability fields.
+- Dedicated timing-breakdown and batch-comparability sections in HTML reports.
+- `startup-bound` and `compute-bound` benchmark workloads alongside the existing in-memory, disk-backed, CPU-heavy, and training workloads.
+- Tests for fake-clock lifecycle accounting, training first-batch accounting, sample fingerprints, comparability statuses, selection metrics, strict comparability gating, stability reports, and CLI stability output.
+
+### Changed
+
+- Loader cycle throughput still excludes the first loader batch, but the new amortized metric now makes construction, worker startup, transitions, shutdown, and cleanup visible and selectable.
+- Validation decisions use the configured selection metric and comparability policy; strict comparisons require verified sample identity.
+- Training first-batch samples are counted in total sample accounting, while the first training step remains inside the execution timer.
+- README, examples, and workload documentation now describe protocol 4.0, lifecycle timing, comparability, and stability analysis.
+
+### Fixed
+
+- CUDA Events now record against the current CUDA stream, restoring compatibility with PyTorch 2.14.
+- Training-mode sample accounting includes first-batch samples without double-counting epoch totals.
+- Early validation exits preserve the selected comparability policy and comparison result.
+
+### Known limitations
+
+- Comparability fingerprints detect differences they are given; arbitrary dataset or transform state cannot be proven equivalent.
+- Detailed CUDA event timing can perturb very short transfers or training steps.
+- The memory limit remains sampled and advisory.
+- macOS is not covered by CI in this release.
+
 ## [0.3.0] - 2026-11-17
 
 ### Added

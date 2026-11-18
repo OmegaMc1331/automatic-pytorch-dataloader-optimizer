@@ -4,7 +4,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from apdo.config import VALIDATION_POLICIES, LoaderConfig
+from apdo.comparability import ComparabilityResult
+from apdo.config import (
+    COMPARABILITY_POLICIES,
+    SELECTION_METRICS,
+    VALIDATION_POLICIES,
+    LoaderConfig,
+)
 from apdo.metrics import MetricsSummary, PassMetrics, bootstrap_median_ci, median, summarize_passes
 from apdo.order import derive_seed
 
@@ -27,16 +33,23 @@ class ValidationObservation:
 
     @property
     def gain(self) -> float:
-        if self.baseline.throughput <= 0:
+        return self.gain_for("sustained")
+
+    def gain_for(self, selection_metric: str) -> float:
+        baseline = _metric_throughput(self.baseline, selection_metric)
+        candidate = _metric_throughput(self.candidate, selection_metric)
+        if baseline <= 0:
             return 0.0
-        return self.candidate.throughput / self.baseline.throughput - 1.0
+        return candidate / baseline - 1.0
 
     def to_dict(self) -> dict[str, Any]:
+        amortized_gain = self.gain_for("amortized")
         return {
             "round_index": self.round_index,
             "baseline": self.baseline.to_dict(),
             "candidate": self.candidate.to_dict(),
             "gain_percent": self.gain * 100.0,
+            "gain_amortized_percent": amortized_gain * 100.0,
         }
 
 
@@ -56,6 +69,9 @@ class ValidationResult:
     reason: str
     enabled: bool
     policy: str = "minimum"
+    selection_metric: str = "sustained"
+    comparability: ComparabilityResult | None = None
+    comparability_policy: str = "warn"
 
     @property
     def confirmed(self) -> bool:
@@ -79,6 +95,11 @@ class ValidationResult:
             "min_improvement_percent": self.min_improvement_percent,
             "reason": self.reason,
             "policy": self.policy,
+            "selection_metric": self.selection_metric,
+            "comparability_policy": self.comparability_policy,
+            "comparability": (
+                self.comparability.to_dict() if self.comparability is not None else None
+            ),
             "threshold_guaranteed": self.threshold_guaranteed,
             "observations": [observation.to_dict() for observation in self.observations],
             "failures": list(self.failures),
@@ -100,6 +121,9 @@ def analyze_validation(
     seed: int,
     failures: Sequence[str] = (),
     policy: str = "minimum",
+    selection_metric: str = "sustained",
+    comparability: ComparabilityResult | None = None,
+    comparability_policy: str = "warn",
 ) -> ValidationResult:
     baseline_passes = [item.baseline for item in observations]
     candidate_passes = [item.candidate for item in observations]
@@ -108,6 +132,10 @@ def analyze_validation(
     min_percent = min_improvement * 100.0
     if policy not in VALIDATION_POLICIES:
         raise ValueError(f"unknown validation policy {policy!r}")
+    if selection_metric not in SELECTION_METRICS:
+        raise ValueError(f"unknown selection metric {selection_metric!r}")
+    if comparability_policy not in COMPARABILITY_POLICIES:
+        raise ValueError(f"unknown comparability policy {comparability_policy!r}")
 
     if candidate_config == baseline_config:
         return _result(
@@ -128,6 +156,9 @@ def analyze_validation(
             ),
             enabled=enabled,
             policy=policy,
+            selection_metric=selection_metric,
+            comparability=comparability,
+            comparability_policy=comparability_policy,
         )
 
     if not enabled:
@@ -149,6 +180,9 @@ def analyze_validation(
             ),
             enabled=enabled,
             policy=policy,
+            selection_metric=selection_metric,
+            comparability=comparability,
+            comparability_policy=comparability_policy,
         )
 
     if len(observations) < MIN_VALIDATION_PAIRS:
@@ -171,9 +205,17 @@ def analyze_validation(
             ),
             enabled=enabled,
             policy=policy,
+            selection_metric=selection_metric,
+            comparability=comparability,
+            comparability_policy=comparability_policy,
         )
 
-    gains = [item.gain for item in observations]
+    gains = [item.gain_for(selection_metric) for item in observations]
+    metric_label = (
+        "total-trial amortized throughput"
+        if selection_metric == "amortized"
+        else "sustained throughput"
+    )
     observed = median(gains)
     ci_low, ci_high = bootstrap_median_ci(
         gains,
@@ -189,6 +231,7 @@ def analyze_validation(
         status = "regression"
         reason = (
             f"Validation observed a median candidate change of {observed_percent:+.1f}% "
+            f"in {metric_label} "
             f"with a 95% paired bootstrap interval of [{ci_low_percent:+.1f}%, "
             f"{ci_high_percent:+.1f}%]. The candidate was not faster, so the initial "
             "configuration is retained."
@@ -203,7 +246,7 @@ def analyze_validation(
             guarantee = "the interval is strictly above zero"
         reason = (
             f"Validation observed a median candidate improvement of "
-            f"{observed_percent:+.1f}% with a 95% paired bootstrap interval of "
+            f"{observed_percent:+.1f}% in {metric_label} with a 95% paired bootstrap interval of "
             f"[{ci_low_percent:+.1f}%, {ci_high_percent:+.1f}%]. The observed gain "
             f"meets the {min_percent:.1f}% minimum and {guarantee}."
         )
@@ -218,10 +261,30 @@ def analyze_validation(
             requirement = "the interval is not strictly above zero"
         reason = (
             f"Validation observed a median candidate change of {observed_percent:+.1f}% "
+            f"in {metric_label} "
             f"with a 95% paired bootstrap interval of [{ci_low_percent:+.1f}%, "
             f"{ci_high_percent:+.1f}%]. {requirement[0].upper() + requirement[1:]}, "
             "so the initial configuration is retained."
         )
+
+    if comparability is not None and comparability_policy != "off":
+        if status == "confirmed" and comparability_policy == "strict":
+            if not comparability.sufficient_for_strict:
+                status = "not_possible"
+                reason = (
+                    "Independent validation observed a candidate gain, but the strict "
+                    "comparability policy requires verified identical samples and batch "
+                    f"structure in every paired round. {comparability.summary}"
+                )
+        elif status == "confirmed" and comparability.has_observed_problem:
+            status = "not_possible"
+            reason = (
+                "Independent validation observed a candidate gain, but batch "
+                "comparability checks found an observed difference that could invalidate "
+                f"the comparison. {comparability.summary}"
+            )
+        elif status == "confirmed":
+            reason = f"{reason} {comparability.summary}"
 
     return _result(
         status=status,
@@ -238,6 +301,9 @@ def analyze_validation(
         reason=reason,
         enabled=enabled,
         policy=policy,
+        selection_metric=selection_metric,
+        comparability=comparability,
+        comparability_policy=comparability_policy,
     )
 
 
@@ -277,6 +343,9 @@ def _result(
     reason: str,
     enabled: bool,
     policy: str,
+    selection_metric: str,
+    comparability: ComparabilityResult | None = None,
+    comparability_policy: str = "warn",
 ) -> ValidationResult:
     if status not in VALIDATION_STATUSES:
         raise ValueError(f"unknown validation status {status!r}")
@@ -297,4 +366,13 @@ def _result(
         reason=reason,
         enabled=enabled,
         policy=policy,
+        selection_metric=selection_metric,
+        comparability=comparability,
+        comparability_policy=comparability_policy,
     )
+
+
+def _metric_throughput(metrics: PassMetrics, selection_metric: str) -> float:
+    if selection_metric == "amortized":
+        return metrics.amortized_throughput or metrics.throughput
+    return metrics.throughput

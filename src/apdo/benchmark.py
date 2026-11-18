@@ -3,14 +3,15 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from apdo.config import MAX_BENCHMARK_EPOCHS, LoaderConfig
-from apdo.errors import ConfigurationError, DatasetError
+from apdo.comparability import BatchObservations, batch_fingerprint, batch_structure
+from apdo.config import MAX_BENCHMARK_EPOCHS, TIMING_PROFILES, LoaderConfig
+from apdo.errors import ConfigurationError, DatasetError, FingerprintError
 from apdo.isolation import isolated_rng
 from apdo.loader import LoaderSource, LoaderTemplate, map_dataset_length
 from apdo.metrics import (
@@ -22,6 +23,8 @@ from apdo.metrics import (
 from apdo.order import RoundOrder, balanced_orders, derive_seed
 from apdo.resources import MemoryMonitor, MemorySnapshot, process_rss_bytes
 from apdo.training import TrainingStep, TrainingStepFactory, create_training_step
+
+_clock = time.perf_counter
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +191,9 @@ def benchmark_config(
     sample_count_fn: Callable[[Any], int] | None = None,
     epochs: int = 1,
     training_step_factory: TrainingStepFactory | None = None,
+    timing_profile: str = "standard",
+    fingerprint_fn: Callable[[Any], Any] | None = None,
+    collect_comparability: bool = True,
 ) -> ConfigMeasurement:
     template = LoaderTemplate.from_dataset(
         dataset,
@@ -207,6 +213,9 @@ def benchmark_config(
         seed=seed,
         epochs=epochs,
         training_step_factory=training_step_factory,
+        timing_profile=timing_profile,
+        fingerprint_fn=fingerprint_fn,
+        collect_comparability=collect_comparability,
     )
     return stage.measurements[0]
 
@@ -226,6 +235,9 @@ def benchmark_rounds(
     progress: Callable[[str], None] | None = None,
     epochs: int = 1,
     training_step_factory: TrainingStepFactory | None = None,
+    timing_profile: str = "standard",
+    fingerprint_fn: Callable[[Any], Any] | None = None,
+    collect_comparability: bool = True,
 ) -> StageResult:
     source = LoaderSource.from_template(template, "dataloader")
     return benchmark_source(
@@ -242,6 +254,9 @@ def benchmark_rounds(
         progress=progress,
         epochs=epochs,
         training_step_factory=training_step_factory,
+        timing_profile=timing_profile,
+        fingerprint_fn=fingerprint_fn,
+        collect_comparability=collect_comparability,
     )
 
 
@@ -260,6 +275,9 @@ def benchmark_source(
     progress: Callable[[str], None] | None = None,
     epochs: int = 1,
     training_step_factory: TrainingStepFactory | None = None,
+    timing_profile: str = "standard",
+    fingerprint_fn: Callable[[Any], Any] | None = None,
+    collect_comparability: bool = True,
 ) -> StageResult:
     if not configs:
         raise ConfigurationError("at least one configuration is required")
@@ -271,6 +289,12 @@ def benchmark_source(
         raise ConfigurationError("epochs must be an integer")
     if epochs < 1 or epochs > MAX_BENCHMARK_EPOCHS:
         raise ConfigurationError(f"epochs must be between 1 and {MAX_BENCHMARK_EPOCHS}")
+    if timing_profile not in TIMING_PROFILES:
+        raise ConfigurationError(f"timing_profile must be one of {TIMING_PROFILES}")
+    if fingerprint_fn is not None and not callable(fingerprint_fn):
+        raise ConfigurationError("sample_fingerprint_fn must be callable or None")
+    if not isinstance(collect_comparability, bool):
+        raise ConfigurationError("collect_comparability must be a boolean")
 
     training = training_step_factory is not None
     unique_configs = tuple(dict.fromkeys(configs))
@@ -310,6 +334,9 @@ def benchmark_source(
                 epochs=1,
                 training_step_factory=training_step_factory,
                 seed=warmup_seed,
+                timing_profile=timing_profile,
+                fingerprint_fn=fingerprint_fn,
+                collect_comparability=False,
             )
             _record_warmup(accumulators[config], execution)
             if execution.error is not None:
@@ -337,11 +364,7 @@ def benchmark_source(
     for measured_order in planned_orders:
         if not active:
             break
-        if (
-            deadline is not None
-            and measured_order.round_index > 0
-            and time.perf_counter() >= deadline
-        ):
+        if deadline is not None and measured_order.round_index > 0 and _clock() >= deadline:
             budget_exhausted = True
             break
         executed = []
@@ -369,6 +392,9 @@ def benchmark_source(
                 epochs=epochs,
                 training_step_factory=training_step_factory,
                 seed=trial_seed,
+                timing_profile=timing_profile,
+                fingerprint_fn=fingerprint_fn,
+                collect_comparability=collect_comparability,
             )
             _record_measured(
                 accumulators[config],
@@ -419,6 +445,9 @@ def _execute_trial(
     epochs: int,
     training_step_factory: TrainingStepFactory | None,
     seed: int,
+    timing_profile: str,
+    fingerprint_fn: Callable[[Any], Any] | None,
+    collect_comparability: bool,
 ) -> _PassExecution:
     monitor = MemoryMonitor(max_ram_bytes)
     loader: DataLoader | None = None
@@ -428,6 +457,10 @@ def _execute_trial(
     cold_start: float | None = None
     transfer_active = False
     failure: tuple[str, str] | None = None
+    cleanup_s: float | None = None
+    construction_s = 0.0
+    training_setup_s: float | None = None
+    trial_start = _clock()
 
     try:
         with isolated_rng(seed, device):
@@ -437,17 +470,16 @@ def _execute_trial(
                 torch.cuda.reset_peak_memory_stats(device)
                 gpu_stats_reset = True
 
-            construction_start = time.perf_counter()
+            construction_start = _clock()
             loader = source.build(config, isolate=True)
-            construction_s = time.perf_counter() - construction_start
+            construction_s = _clock() - construction_start
             monitor.raise_if_exceeded()
 
             training_step: TrainingStep | None = None
-            training_setup_s: float | None = None
             if training_step_factory is not None:
-                training_setup_start = time.perf_counter()
+                training_setup_start = _clock()
                 training_step = create_training_step(training_step_factory)
-                training_setup_s = time.perf_counter() - training_setup_start
+                training_setup_s = _clock() - training_setup_start
                 monitor.raise_if_exceeded()
 
             pass_metrics = _run_cycles(
@@ -457,26 +489,40 @@ def _execute_trial(
                 device=device,
                 epochs=epochs,
                 training_step=training_step,
+                timing_profile=timing_profile,
+                fingerprint_fn=fingerprint_fn,
+                collect_comparability=collect_comparability,
             )
             monitor.raise_if_exceeded()
-            pass_metrics = _with_setup_timings(
-                pass_metrics,
-                construction_s=construction_s,
-                training_setup_s=training_setup_s,
-            )
             transfer_active = pass_metrics.gpu_transfer_active
-            cold_start = construction_s + (training_setup_s or 0.0) + pass_metrics.startup_s
     except KeyboardInterrupt:
         raise
     except Exception as exc:
         failure = (type(exc).__name__, _describe_exception(exc))
     finally:
-        cleanup_failure = _shutdown_loader(loader) if loader is not None else None
+        if loader is not None:
+            cleanup_start = _clock()
+            cleanup_failure = _shutdown_loader(loader)
+            cleanup_s = _clock() - cleanup_start
+        else:
+            cleanup_failure = None
         snapshot = monitor.stop()
+        trial_end = _clock()
         if gpu_stats_reset:
             gpu_peak = _gpu_peak_bytes(device)
         if failure is None and cleanup_failure is not None:
             failure = cleanup_failure
+
+    if pass_metrics is not None:
+        pass_metrics = _with_setup_timings(
+            pass_metrics,
+            construction_s=construction_s,
+            training_setup_s=training_setup_s,
+            loader_cleanup_s=cleanup_s,
+            total_elapsed_s=trial_end - trial_start,
+        )
+        transfer_active = transfer_active or pass_metrics.gpu_transfer_active
+        cold_start = construction_s + (training_setup_s or 0.0) + pass_metrics.startup_s
 
     return _PassExecution(
         pass_metrics=pass_metrics,
@@ -496,6 +542,9 @@ def _run_cycles(
     device: torch.device,
     epochs: int,
     training_step: TrainingStep | None,
+    timing_profile: str = "standard",
+    fingerprint_fn: Callable[[Any], Any] | None = None,
+    collect_comparability: bool = True,
 ) -> PassMetrics:
     cycles: list[CycleMetrics] = []
     for cycle_index in range(epochs):
@@ -506,32 +555,31 @@ def _run_cycles(
             device=device,
             cycle_index=cycle_index,
             training_step=training_step,
+            timing_profile=timing_profile,
+            fingerprint_fn=fingerprint_fn,
+            collect_comparability=collect_comparability,
         )
         cycles.append(cycle)
 
     cold_startup_s = cycles[0].startup_s
     training = training_step is not None
-    if epochs == 1:
-        sustained_cycles = cycles[:1]
-        first_sample_adjustment = 0 if training else cycles[0].first_batch_samples
-    else:
-        sustained_cycles = cycles[1:]
-        first_sample_adjustment = 0
-    steady_samples = sum(item.samples for item in sustained_cycles)
-    steady_samples = max(steady_samples - first_sample_adjustment, 0)
-    steady_elapsed = sum(item.duration_s for item in sustained_cycles)
+    settled_cycles = cycles[:1] if epochs == 1 else cycles[1:]
+    steady_samples = sum(item.steady_samples for item in settled_cycles)
+    steady_elapsed = sum(item.duration_s for item in settled_cycles)
     throughput = steady_samples / steady_elapsed if steady_elapsed > 0 else 0.0
-    sustained_throughput = (
-        sum(item.samples for item in cycles[1:]) / sum(item.duration_s for item in cycles[1:])
-        if len(cycles) > 1
-        else throughput
-    )
-    transitions = [item.startup_s for item in cycles[1:]]
+    transitions = [item.iterator_init_s + item.first_batch_s for item in cycles[1:]]
     worker_startup = 0.0 if loader.persistent_workers else sum(transitions)
     all_latencies = tuple(latency for item in cycles for latency in item.latencies_s)
+    step_device_latencies = tuple(
+        latency for item in cycles for latency in item.step_device_latencies_s
+    )
+    transfer_values = [item.transfer_s for item in cycles if item.transfer_s is not None]
+    transfer_device_values = [
+        item.transfer_device_s for item in cycles if item.transfer_device_s is not None
+    ]
+    cuda_values = [item.cuda_execution_s for item in cycles if item.cuda_execution_s is not None]
     total_batches = sum(item.batches for item in cycles)
-    expected_batches = plan.expected_batches or plan.batches
-    full_epoch = plan.full_epoch and all(item.batches >= expected_batches for item in cycles)
+    full_epoch = plan.full_epoch and all(item.full_epoch for item in cycles)
     training_cycles = [item for item in cycles if item.data_wait_s is not None]
     return PassMetrics(
         startup_s=cold_startup_s,
@@ -543,8 +591,8 @@ def _run_cycles(
         gpu_transfer_active=any(item.transfer_active for item in cycles),
         construction_s=None,
         training_setup_s=None,
-        total_elapsed_s=sum(item.duration_s + item.startup_s for item in cycles),
-        sustained_throughput=sustained_throughput,
+        total_elapsed_s=sum(item.cycle_wall_s for item in cycles),
+        sustained_throughput=throughput,
         cycles=tuple(cycles),
         expected_batches=plan.expected_batches,
         full_epoch=full_epoch,
@@ -552,10 +600,24 @@ def _run_cycles(
         data_wait_s=(
             sum(item.data_wait_s or 0.0 for item in training_cycles) if training_cycles else None
         ),
-        transfer_s=(sum(item.transfer_s or 0.0 for item in cycles) if training else None),
-        transfer_bytes=sum(item.transfer_bytes or 0 for item in cycles) if training else None,
+        transfer_s=sum(transfer_values) if transfer_values else None,
+        transfer_bytes=(
+            sum(item.transfer_bytes or 0 for item in cycles)
+            if any(item.transfer_bytes is not None for item in cycles)
+            else None
+        ),
         worker_startup_overhead_s=worker_startup,
         average_epoch_transition_s=(sum(transitions) / len(transitions) if transitions else 0.0),
+        amortized_throughput=None,
+        total_samples=sum(item.samples for item in cycles),
+        iterator_init_s=sum(item.iterator_init_s for item in cycles),
+        first_batch_s=sum(item.first_batch_s for item in cycles),
+        worker_shutdown_s=sum(item.shutdown_s for item in cycles),
+        loader_cleanup_s=None,
+        cuda_execution_s=sum(cuda_values) if cuda_values else None,
+        transfer_device_s=(sum(transfer_device_values) if transfer_device_values else None),
+        step_device_latencies_s=step_device_latencies,
+        timing_profile=timing_profile,
     )
 
 
@@ -564,29 +626,17 @@ def _with_setup_timings(
     *,
     construction_s: float,
     training_setup_s: float | None,
+    loader_cleanup_s: float | None,
+    total_elapsed_s: float,
 ) -> PassMetrics:
-    total_elapsed = (metrics.total_elapsed_s or 0.0) + construction_s + (training_setup_s or 0.0)
-    return PassMetrics(
-        startup_s=metrics.startup_s,
-        steady_elapsed_s=metrics.steady_elapsed_s,
-        batches=metrics.batches,
-        steady_samples=metrics.steady_samples,
-        throughput=metrics.throughput,
-        latencies_s=metrics.latencies_s,
-        gpu_transfer_active=metrics.gpu_transfer_active,
+    amortized = metrics.total_samples / total_elapsed_s if total_elapsed_s > 0 else None
+    return replace(
+        metrics,
         construction_s=construction_s,
         training_setup_s=training_setup_s,
-        total_elapsed_s=total_elapsed,
-        sustained_throughput=metrics.sustained_throughput,
-        cycles=metrics.cycles,
-        expected_batches=metrics.expected_batches,
-        full_epoch=metrics.full_epoch,
-        training=metrics.training,
-        data_wait_s=metrics.data_wait_s,
-        transfer_s=metrics.transfer_s,
-        transfer_bytes=metrics.transfer_bytes,
-        worker_startup_overhead_s=metrics.worker_startup_overhead_s,
-        average_epoch_transition_s=metrics.average_epoch_transition_s,
+        loader_cleanup_s=loader_cleanup_s,
+        total_elapsed_s=total_elapsed_s,
+        amortized_throughput=amortized,
     )
 
 
@@ -598,50 +648,113 @@ def _run_cycle(
     device: torch.device,
     cycle_index: int,
     training_step: TrainingStep | None,
+    timing_profile: str = "standard",
+    fingerprint_fn: Callable[[Any], Any] | None = None,
+    collect_comparability: bool = True,
 ) -> CycleMetrics:
     transfer = device.type == "cuda"
+    detailed = timing_profile == "detailed"
     if transfer:
         torch.cuda.synchronize(device)
 
+    cycle_wall_start = _clock()
+    iterator_init_start = _clock()
     iterator = iter(loader)
-    startup_start = time.perf_counter()
-    first_batch: Any | None = None
+    iterator_init_s = _clock() - iterator_init_start
+    first_batch_start = _clock()
     try:
         first_batch = next(iterator)
     except StopIteration as exc:
         _shutdown_iterator(iterator)
         raise DatasetError("the DataLoader produced no batches") from exc
-    startup_s = time.perf_counter() - startup_start
+    first_batch_s = _clock() - first_batch_start
+    startup_s = iterator_init_s + first_batch_s
+    worker_pids = _worker_pids(iterator)
 
-    cycle_start = time.perf_counter()
+    cycle_start = _clock()
+    cycle_events: tuple[Any, Any] | None = None
+    cuda_stream = torch.cuda.current_stream(device) if transfer else None
+    if transfer:
+        cycle_events = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+        cycle_events[0].record(cuda_stream)
+
+    transfer_events: list[tuple[Any, Any]] = []
+    step_events: list[tuple[Any, Any]] = []
+
+    def start_device_pair() -> tuple[Any, Any] | None:
+        if not (transfer and detailed):
+            return None
+        pair = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+        pair[0].record(cuda_stream)
+        return pair
+
+    def finish_device_pair(
+        pair: tuple[Any, Any] | None,
+        collection: list[tuple[Any, Any]],
+    ) -> None:
+        if pair is not None:
+            pair[1].record(cuda_stream)
+            collection.append(pair)
+
     latencies: list[float] = []
     data_wait_s = 0.0
     transfer_s = 0.0
     transfer_bytes = 0
     transfer_active = False
     step_latencies: list[float] = []
+    structures: list[str] = []
+    fingerprints: list[str] = []
+    sample_counts: list[int] = []
     rss = process_rss_bytes()
+    shutdown_s = 0.0
+    failed = False
+
+    def observe(raw_batch: Any, sample_count: int) -> None:
+        if not collect_comparability:
+            return
+        structures.append(batch_structure(raw_batch))
+        sample_counts.append(sample_count)
+        if fingerprint_fn is not None:
+            try:
+                fingerprints.append(batch_fingerprint(fingerprint_fn(raw_batch)))
+            except FingerprintError:
+                raise
+            except Exception as exc:
+                raise FingerprintError(
+                    "sample_fingerprint_fn failed while processing batch "
+                    f"{len(sample_counts)}: {type(exc).__name__}: {exc}"
+                ) from exc
 
     batch = first_batch
     first_samples = source.count_samples(batch)
+    observe(batch, first_samples)
     if transfer:
         size = _tensor_bytes(batch)
-        move_start = time.perf_counter()
+        pair = start_device_pair()
+        move_start = _clock()
         batch, moved_any = _move_to_device(batch, device)
-        transfer_s += time.perf_counter() - move_start
+        transfer_s += _clock() - move_start
+        finish_device_pair(pair, transfer_events)
         transfer_bytes += size
         transfer_active = transfer_active or moved_any
     if training_step is not None:
-        step_start = time.perf_counter()
+        pair = start_device_pair()
+        step_start = _clock()
         training_step(batch)
-        step_latencies.append(time.perf_counter() - step_start)
+        step_latencies.append(_clock() - step_start)
+        finish_device_pair(pair, step_events)
 
     batches = 1
     samples = first_samples
-    failed = False
     try:
         for _ in range(1, plan.batches):
-            wait_start = time.perf_counter()
+            wait_start = _clock()
             batch_start = wait_start
             try:
                 batch = next(iterator)
@@ -649,34 +762,66 @@ def _run_cycle(
                 raise DatasetError(
                     f"the DataLoader produced fewer than the planned {plan.batches} batches"
                 ) from exc
-            data_wait_s += time.perf_counter() - wait_start
+            data_wait_s += _clock() - wait_start
             samples_this = source.count_samples(batch)
+            observe(batch, samples_this)
             if transfer:
                 size = _tensor_bytes(batch)
-                move_start = time.perf_counter()
+                pair = start_device_pair()
+                move_start = _clock()
                 batch, moved_any = _move_to_device(batch, device)
-                transfer_s += time.perf_counter() - move_start
+                transfer_s += _clock() - move_start
+                finish_device_pair(pair, transfer_events)
                 transfer_bytes += size
                 transfer_active = transfer_active or moved_any
             if training_step is not None:
-                step_start = time.perf_counter()
+                pair = start_device_pair()
+                step_start = _clock()
                 training_step(batch)
-                step_latencies.append(time.perf_counter() - step_start)
+                step_latencies.append(_clock() - step_start)
+                finish_device_pair(pair, step_events)
             batches += 1
             samples += samples_this
-            latencies.append(time.perf_counter() - batch_start)
+            latencies.append(_clock() - batch_start)
+
+        cuda_execution_s: float | None = None
+        transfer_device_s: float | None = None
+        step_device_latencies: tuple[float, ...] = ()
         if transfer:
+            assert cycle_events is not None
+            cycle_events[1].record(cuda_stream)
             torch.cuda.synchronize(device)
-        duration_s = max(time.perf_counter() - cycle_start, 1e-9)
+            cuda_execution_s = cycle_events[0].elapsed_time(cycle_events[1]) / 1000.0
+            if detailed:
+                transfer_device_s = (
+                    sum(start.elapsed_time(end) for start, end in transfer_events) / 1000.0
+                )
+                step_device_latencies = tuple(
+                    start.elapsed_time(end) / 1000.0 for start, end in step_events
+                )
+        duration_s = max(_clock() - cycle_start, 1e-9)
     except BaseException:
         failed = True
         raise
     finally:
         if failed or not loader.persistent_workers:
+            shutdown_start = _clock()
             _shutdown_iterator(iterator)
+            shutdown_s = _clock() - shutdown_start
 
-    throughput = samples / duration_s
+    batch_observations = (
+        BatchObservations(
+            structures=tuple(structures),
+            sample_counts=tuple(sample_counts),
+            fingerprints=(tuple(fingerprints) if fingerprint_fn is not None else None),
+        )
+        if collect_comparability
+        else None
+    )
     training = training_step is not None
+    execution_samples = samples if training else max(samples - first_samples, 0)
+    throughput = execution_samples / duration_s
+    cycle_wall_s = _clock() - cycle_wall_start
     return CycleMetrics(
         cycle_index=cycle_index,
         startup_s=startup_s,
@@ -685,17 +830,27 @@ def _run_cycle(
         samples=samples,
         throughput=throughput,
         steady_elapsed_s=duration_s,
-        steady_samples=samples,
+        steady_samples=execution_samples,
         steady_throughput=throughput,
         latencies_s=tuple(latencies),
         rss_bytes=rss,
         data_wait_s=data_wait_s if training else None,
-        transfer_s=transfer_s if training else None,
-        transfer_bytes=transfer_bytes if training else None,
+        transfer_s=transfer_s if transfer else None,
+        transfer_bytes=transfer_bytes if transfer else None,
         transfer_active=transfer_active,
         step_latencies_s=tuple(step_latencies),
         first_batch_samples=first_samples,
-        worker_pids=_worker_pids(iterator),
+        iterator_init_s=iterator_init_s,
+        first_batch_s=first_batch_s,
+        shutdown_s=shutdown_s,
+        cycle_wall_s=cycle_wall_s,
+        full_epoch=plan.full_epoch and batches >= (plan.expected_batches or plan.batches),
+        timing_profile=timing_profile,
+        cuda_execution_s=cuda_execution_s,
+        transfer_device_s=transfer_device_s,
+        step_device_latencies_s=step_device_latencies,
+        batch_observations=batch_observations,
+        worker_pids=worker_pids,
     )
 
 

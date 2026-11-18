@@ -222,8 +222,8 @@ def test_optimize_preserves_a_custom_dataloader(tmp_path) -> None:
 def test_optimize_runs_validation_for_a_noninitial_candidate(monkeypatch) -> None:
     original = optimizer_module._select_configuration
 
-    def force_worker_candidate(measurements):
-        selection = original(measurements)
+    def force_worker_candidate(measurements, selection_metric="sustained"):
+        selection = original(measurements, selection_metric)
         candidate = next(
             (item for item in measurements if item.succeeded and item.config.num_workers > 0),
             None,
@@ -538,3 +538,44 @@ def test_optimize_accepts_dataloader_factory_and_rebuilds_with_it() -> None:
     built = result.build_dataloader()
     assert built.batch_size == 4
     assert built.num_workers == result.best_config.num_workers
+
+
+def test_selection_metric_uses_amortized_throughput() -> None:
+    simple = make_measurement(LoaderConfig(), (100.0, 100.0, 100.0))
+    simple = replace(
+        simple,
+        summary=replace(
+            simple.summary,
+            median_amortized_throughput=20.0,
+            ci_low_amortized_throughput=18.0,
+            ci_high_amortized_throughput=22.0,
+        ),
+    )
+    workers = make_measurement(LoaderConfig(4), (100.0, 100.0, 100.0))
+    workers = replace(
+        workers,
+        summary=replace(
+            workers.summary,
+            median_amortized_throughput=10.0,
+            ci_low_amortized_throughput=9.0,
+            ci_high_amortized_throughput=11.0,
+        ),
+    )
+
+    selection = _select_configuration([simple, workers], selection_metric="amortized")
+
+    assert selection.selected.config == simple.config
+    assert selection.fastest.config == simple.config
+
+
+def test_optimize_rejects_invalid_timing_and_comparability_options() -> None:
+    dataset = SyntheticDataset(size=16)
+
+    with pytest.raises(ConfigurationError, match="timing_profile"):
+        optimize(dataset, batch_size=4, timing_profile="fast")
+    with pytest.raises(ConfigurationError, match="selection_metric"):
+        optimize(dataset, batch_size=4, selection_metric="fastest")
+    with pytest.raises(ConfigurationError, match="comparability_policy"):
+        optimize(dataset, batch_size=4, comparability_policy="maybe")
+    with pytest.raises(ConfigurationError, match="sample_fingerprint_fn"):
+        optimize(dataset, batch_size=4, sample_fingerprint_fn=42)

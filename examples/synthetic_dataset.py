@@ -75,4 +75,19 @@ def create_sample_counter() -> Callable[[Any], int]:
     return count_batch
 
 
+def fingerprint_batch(batch: tuple[torch.Tensor, torch.Tensor]) -> Any:
+    features, labels = batch
+    if isinstance(labels, torch.Tensor):
+        labels = labels.detach().cpu()
+        return (
+            tuple(labels.reshape(-1).tolist()),
+            tuple(features.reshape(features.shape[0], -1)[0].tolist()),
+        )
+    return (labels,)
+
+
+def create_sample_fingerprint() -> Callable[[Any], Any]:
+    return fingerprint_batch
+
+
 training_step_factory = create_training_step_factory("cpu")

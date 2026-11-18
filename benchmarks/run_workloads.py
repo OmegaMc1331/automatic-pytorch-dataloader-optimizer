@@ -11,12 +11,19 @@ try:
 except ModuleNotFoundError:
     from workloads import build_training_step_factory, build_workload
 
-WORKLOADS = ("in-memory", "disk-backed", "cpu-heavy", "training")
+WORKLOADS = (
+    "in-memory",
+    "disk-backed",
+    "cpu-heavy",
+    "startup-bound",
+    "compute-bound",
+    "training",
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run the four APDO v0.3.0 workloads and write JSON/HTML reports."
+        description="Run the six APDO v0.4.0 workloads and write JSON/HTML reports."
     )
     parser.add_argument(
         "--workload",
@@ -111,6 +118,9 @@ def main() -> int:
             validation_rounds=args.validation_rounds,
             max_workers=args.max_workers,
             seed=args.seed,
+            timing_profile="standard",
+            selection_metric="sustained",
+            comparability_policy="warn",
             progress=lambda message: print(message, flush=True),
         )
         json_path = args.output_directory / f"{name}.json"
@@ -135,6 +145,14 @@ def main() -> int:
                 "median_throughput": result.best_summary.median_throughput,
                 "throughput_kind": ("end_to_end_training" if training else "loader"),
                 "baseline_throughput": result.baseline_throughput,
+                "median_sustained_throughput": result.best_summary.median_sustained_throughput,
+                "median_amortized_throughput": result.best_summary.median_amortized_throughput,
+                "median_total_elapsed_s": result.best_summary.median_total_elapsed_s,
+                "comparability": (
+                    result.validation.comparability.to_dict()
+                    if result.validation.comparability is not None
+                    else None
+                ),
                 "duration_s": result.duration_s,
             }
         )

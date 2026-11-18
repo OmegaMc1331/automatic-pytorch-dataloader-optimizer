@@ -28,7 +28,7 @@ LoaderFactory = Callable[[LoaderConfig], DataLoader]
 def map_dataset_length(dataset: Any) -> int:
     if isinstance(dataset, IterableDataset):
         raise DatasetError(
-            "IterableDataset is not supported in v0.3.0; use a map-style dataset "
+            "IterableDataset is not supported in v0.4.0; use a map-style dataset "
             "with __len__ and __getitem__"
         )
     if not hasattr(dataset, "__getitem__"):

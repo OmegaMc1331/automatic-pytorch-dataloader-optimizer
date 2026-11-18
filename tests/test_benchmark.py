@@ -321,8 +321,13 @@ def test_training_benchmark_records_end_to_end_metrics() -> None:
     assert measurement.summary.median_step_latency_s is not None
     assert measurement.summary.median_data_wait_s is not None
     assert calls == 1
-    assert len(measurement.passes[0].cycles) == 2
-    assert all(len(cycle.step_latencies_s) == 4 for cycle in measurement.passes[0].cycles)
+    pass_metrics = measurement.passes[0]
+    assert len(pass_metrics.cycles) == 2
+    assert all(len(cycle.step_latencies_s) == 4 for cycle in pass_metrics.cycles)
+    assert (
+        sum(cycle.first_batch_samples for cycle in pass_metrics.cycles)
+        == len(pass_metrics.cycles) * 4
+    )
 
 
 def test_multi_epoch_nonpersistent_workers_record_transitions() -> None:
@@ -388,3 +393,85 @@ def test_cycle_throughput_excludes_worker_teardown(monkeypatch) -> None:
 
     assert wall >= 1.0
     assert cycle.duration_s < 0.9
+
+
+def test_lifecycle_phases_are_recorded_with_a_fake_clock(monkeypatch) -> None:
+    dataset = SyntheticDataset(size=16, feature_dim=4)
+    plan = plan_batches(len(dataset), 4, None)
+
+    class FakeClock:
+        def __init__(self) -> None:
+            self.value = 0.0
+            self.calls = 0
+
+        def __call__(self) -> float:
+            self.calls += 1
+            self.value += 0.01
+            return self.value
+
+    clock = FakeClock()
+    monkeypatch.setattr("apdo.benchmark._clock", clock)
+
+    measurement = benchmark_config(
+        dataset,
+        LoaderConfig(),
+        phase="loader",
+        batch_size=4,
+        device=torch.device("cpu"),
+        plan=plan,
+        warmup_runs=0,
+        repetitions=1,
+        max_ram_bytes=None,
+        epochs=2,
+    )
+
+    assert measurement.succeeded
+    assert clock.calls > 10
+    pass_metrics = measurement.passes[0]
+    assert pass_metrics.iterator_init_s > 0.0
+    assert pass_metrics.first_batch_s > 0.0
+    assert pass_metrics.worker_shutdown_s > 0.0
+    assert pass_metrics.loader_cleanup_s is not None
+    assert pass_metrics.loader_cleanup_s > 0.0
+    assert pass_metrics.startup_s > 0.0
+    assert (
+        pass_metrics.startup_s <= pass_metrics.iterator_init_s + pass_metrics.first_batch_s + 1e-9
+    )
+    assert pass_metrics.total_elapsed_s is not None
+    assert pass_metrics.total_elapsed_s > 0.0
+    assert pass_metrics.total_samples == 32
+    assert pass_metrics.amortized_throughput is not None
+    assert pass_metrics.amortized_throughput == pytest.approx(
+        pass_metrics.total_samples / pass_metrics.total_elapsed_s
+    )
+    assert pass_metrics.sustained_throughput is not None
+    assert pass_metrics.sustained_throughput > 0.0
+
+
+def test_benchmark_records_fingerprint_observations() -> None:
+    dataset = SyntheticDataset(size=16, feature_dim=4)
+    plan = plan_batches(len(dataset), 4, None)
+
+    def fingerprint(batch: tuple[torch.Tensor, torch.Tensor]) -> tuple[int, ...]:
+        return tuple(batch[1].tolist())
+
+    measurement = benchmark_config(
+        dataset,
+        LoaderConfig(),
+        phase="loader",
+        batch_size=4,
+        device=torch.device("cpu"),
+        plan=plan,
+        warmup_runs=0,
+        repetitions=1,
+        max_ram_bytes=None,
+        epochs=1,
+        fingerprint_fn=fingerprint,
+    )
+
+    assert measurement.succeeded
+    observations = measurement.passes[0].cycles[0].batch_observations
+    assert observations is not None
+    assert observations.fingerprints_available
+    assert observations.batch_count == 4
+    assert observations.sample_counts == (4, 4, 4, 4)

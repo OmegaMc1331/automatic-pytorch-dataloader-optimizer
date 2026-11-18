@@ -5,9 +5,12 @@ from typing import Any
 
 from apdo.errors import ConfigurationError
 
-BENCHMARK_PROTOCOL_VERSION = "3.0"
+BENCHMARK_PROTOCOL_VERSION = "4.0"
 BENCHMARK_MODES = ("loader", "training")
 VALIDATION_POLICIES = ("minimum", "positive")
+TIMING_PROFILES = ("standard", "detailed")
+SELECTION_METRICS = ("sustained", "amortized")
+COMPARABILITY_POLICIES = ("off", "warn", "strict")
 MAX_BENCHMARK_EPOCHS = 20
 
 
@@ -98,7 +101,7 @@ class BenchmarkSettings:
     time_budget_s: float | None = None
     initial_config: LoaderConfig = field(default_factory=LoaderConfig)
     input_kind: str = "dataset"
-    protocol_version: str = "3.0"
+    protocol_version: str = BENCHMARK_PROTOCOL_VERSION
     expected_batches: int | None = None
     benchmark_mode: str = "loader"
     epochs: int = 1
@@ -107,6 +110,10 @@ class BenchmarkSettings:
     max_training_candidates: int = 3
     validation_policy: str = "minimum"
     reproducibility_status: str = "verified"
+    timing_profile: str = "standard"
+    selection_metric: str = "sustained"
+    comparability_policy: str = "warn"
+    sample_fingerprint: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -137,4 +144,8 @@ class BenchmarkSettings:
             "max_training_candidates": self.max_training_candidates,
             "validation_policy": self.validation_policy,
             "reproducibility_status": self.reproducibility_status,
+            "timing_profile": self.timing_profile,
+            "selection_metric": self.selection_metric,
+            "comparability_policy": self.comparability_policy,
+            "sample_fingerprint": self.sample_fingerprint,
         }

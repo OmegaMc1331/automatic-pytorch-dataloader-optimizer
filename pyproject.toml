@@ -58,6 +58,7 @@ include = [
     "/benchmarks/__init__.py",
     "/benchmarks/run_workloads.py",
     "/benchmarks/workloads.py",
+    "/docs",
     "/README.md",
     "/LICENSE",
     "/CHANGELOG.md",

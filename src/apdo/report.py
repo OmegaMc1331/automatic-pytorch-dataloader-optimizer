@@ -20,10 +20,11 @@ from apdo.validation import ValidationResult
 
 METHOD = {
     "protocol": (
-        "Benchmark protocol 3.0. Search configurations run in loaded, seeded, balanced "
+        "Benchmark protocol 4.0. Search configurations run in loaded, seeded, balanced "
         "rounds. Loader trials reuse one DataLoader across the configured epochs; each "
         "trial is wrapped in global RNG state isolation. Training mode adds an explicit "
-        "end-to-end finalist stage. The executed order is recorded."
+        "end-to-end finalist stage. Iterator initialization, first-batch acquisition, "
+        "worker shutdown, loader cleanup, and total trial wall are recorded separately."
     ),
     "search": (
         "Two-stage loader grid search followed, in training mode, by a progressive "
@@ -56,8 +57,9 @@ METHOD = {
     "throughput_scope": (
         "Loader mode measures data loading plus host-to-device tensor copies when the "
         "resolved device is CUDA. Training mode measures the complete explicit forward, "
-        "loss, backward, and optimizer step around the loader, with CUDA synchronized only "
-        "at measurement boundaries."
+        "loss, backward, and optimizer step around the loader. Standard timing uses "
+        "whole-cycle CUDA Events; detailed timing adds transfer and per-step device "
+        "events without per-batch synchronization."
     ),
 }
 
@@ -87,6 +89,9 @@ LIMITATIONS = (
     "for Windows and Linux.",
     "Variable-size batches are supported through actual sample counting, but the count "
     "must be inferable from tensor leading dimensions or supplied by sample_count_fn.",
+    "Comparability diagnostics hash batch structure and optional sample fingerprints. "
+    "They can detect supported differences in sampled content and order, but they are "
+    "not a proof that arbitrary data pipelines are equivalent.",
 )
 
 
@@ -100,6 +105,7 @@ class OptimizationResult:
     warnings: tuple[str, ...]
     selection_reason: str
     baseline_throughput: float | None
+    baseline_amortized_throughput: float | None
     improvement_percent: float | None
     started_at: datetime
     duration_s: float
@@ -112,6 +118,10 @@ class OptimizationResult:
     search_selection_reason: str | None = None
     budget_exhausted: bool = False
     version: str = __version__
+
+    @property
+    def comparability(self) -> Any:
+        return self.validation.comparability
 
     @property
     def best_summary(self) -> MetricsSummary:
@@ -172,6 +182,13 @@ class OptimizationResult:
             f"(p95 {_fmt_ms(summary.p95_latency_s)})",
             f"  startup to first batch: {_fmt_ms(summary.median_startup_s)} "
             f"(cold start {cold_start})",
+            f"  amortized trial throughput: "
+            f"{_fmt_optional_throughput(summary.median_amortized_throughput)}",
+            f"  median total trial wall: {_fmt_ms(summary.median_total_elapsed_s)}",
+            f"  lifecycle: iterator {_fmt_ms(summary.median_iterator_init_s)}, "
+            f"first batch {_fmt_ms(summary.median_first_batch_s)}, "
+            f"worker shutdown {_fmt_ms(summary.median_worker_shutdown_s)}, "
+            f"loader cleanup {_fmt_ms(summary.median_loader_cleanup_s)}",
             f"  observed memory: {memory}",
             f"  {improvement}",
         ]
@@ -273,7 +290,7 @@ class OptimizationResult:
             baseline_payload["training_summary"] = training_baseline.summary.to_dict()
             baseline_payload["training_config"] = training_baseline.config.to_dict()
         return {
-            "schema_version": 3,
+            "schema_version": 4,
             "apdo_version": self.version,
             "started_at_utc": self.started_at.isoformat(),
             "duration_s": self.duration_s,
@@ -285,6 +302,10 @@ class OptimizationResult:
                 "min_improvement": self.settings.min_improvement,
                 "validation_enabled": self.settings.validation_enabled,
                 "validation_policy": self.settings.validation_policy,
+                "timing_profile": self.settings.timing_profile,
+                "selection_metric": self.settings.selection_metric,
+                "comparability_policy": self.settings.comparability_policy,
+                "sample_fingerprint": self.settings.sample_fingerprint,
                 "training_rounds": self.settings.training_rounds,
                 "training_validation_rounds": self.settings.training_validation_rounds,
                 "max_training_candidates": self.settings.max_training_candidates,
@@ -319,9 +340,18 @@ class OptimizationResult:
             },
             "training": self._training_details(),
             "validation": self.validation.to_dict(),
+            "timing": self._timing_details(final_measurement),
+            "comparability": (
+                self.validation.comparability.to_dict()
+                if self.validation.comparability is not None
+                else None
+            ),
             "recommended": {
                 "config": self.best_config.to_dict(),
                 "median_throughput": final_summary.median_throughput,
+                "median_sustained_throughput": final_summary.median_sustained_throughput,
+                "median_amortized_throughput": final_summary.median_amortized_throughput,
+                "median_total_elapsed_s": final_summary.median_total_elapsed_s,
                 "throughput_kind": (
                     "end_to_end_training"
                     if self.settings.benchmark_mode == "training"
@@ -448,6 +478,18 @@ class OptimizationResult:
                     f"{_fmt_optional_throughput(best.median_sustained_throughput)}",
                 )
             )
+        metric_cards.extend(
+            [
+                (
+                    "Amortized trial throughput",
+                    _fmt_optional_throughput(best.median_amortized_throughput),
+                ),
+                ("Median total trial wall", _fmt_ms(best.median_total_elapsed_s)),
+                ("First batch", _fmt_ms(best.median_first_batch_s)),
+                ("Worker shutdown", _fmt_ms(best.median_worker_shutdown_s)),
+                ("Loader cleanup", _fmt_ms(best.median_loader_cleanup_s)),
+            ]
+        )
         cards_html = "\n".join(
             f'<div class="metric"><span>{escape(label)}</span>'
             f"<strong>{escape(value)}</strong></div>"
@@ -564,6 +606,10 @@ class OptimizationResult:
             ("Validation rounds", str(self.settings.validation_rounds)),
             ("Warmup rounds", str(self.settings.warmup_runs)),
             ("Validation policy", self.settings.validation_policy),
+            ("Timing profile", self.settings.timing_profile),
+            ("Selection metric", self.settings.selection_metric),
+            ("Comparability policy", self.settings.comparability_policy),
+            ("Sample fingerprint", "enabled" if self.settings.sample_fingerprint else "disabled"),
             ("Reproducibility", self.settings.reproducibility_status),
             (
                 "Minimum improvement",
@@ -595,6 +641,8 @@ class OptimizationResult:
         )
         limitations_html = "\n".join(f"<li>{escape(item)}</li>" for item in LIMITATIONS)
         validation_html = self._validation_html()
+        timing_html = self._timing_html()
+        comparability_html = self._comparability_html()
         order_html = self._order_html()
 
         return f"""<!DOCTYPE html>
@@ -626,6 +674,10 @@ mode {escape(self.settings.benchmark_mode)} &middot;
 </section>
 
 {validation_html}
+
+{comparability_html}
+
+{timing_html}
 
 {training_html}
 
@@ -928,6 +980,119 @@ loss, backward, and optimizer step around the DataLoader.</p>
             "median_transfer_s": selected.summary_or_raise().median_transfer_s,
             "total_transfer_bytes": selected.summary_or_raise().total_transfer_bytes,
         }
+
+    def _timing_details(self, measurement: ConfigMeasurement) -> dict[str, Any] | None:
+        summary = measurement.summary
+        if summary is None:
+            return None
+        return {
+            "timing_profile": self.settings.timing_profile,
+            "selection_metric": self.settings.selection_metric,
+            "median_total_elapsed_s": summary.median_total_elapsed_s,
+            "median_amortized_throughput": summary.median_amortized_throughput,
+            "ci_low_amortized_throughput": summary.ci_low_amortized_throughput,
+            "ci_high_amortized_throughput": summary.ci_high_amortized_throughput,
+            "median_construction_s": summary.median_construction_s,
+            "median_training_setup_s": summary.median_training_setup_s,
+            "median_iterator_init_s": summary.median_iterator_init_s,
+            "median_first_batch_s": summary.median_first_batch_s,
+            "median_startup_s": summary.median_startup_s,
+            "median_worker_shutdown_s": summary.median_worker_shutdown_s,
+            "median_loader_cleanup_s": summary.median_loader_cleanup_s,
+            "median_sustained_throughput": summary.median_sustained_throughput,
+            "median_cuda_execution_s": summary.median_cuda_execution_s,
+            "median_transfer_device_s": summary.median_transfer_device_s,
+            "median_step_device_latency_s": summary.median_step_device_latency_s,
+        }
+
+    def _timing_html(self) -> str:
+        measurement = self._measurement_for(self.best_config)
+        details = self._timing_details(measurement)
+        if details is None:
+            return ""
+        escape = html.escape
+        rows = [
+            ("Timing profile", self.settings.timing_profile),
+            ("Selection metric", self.settings.selection_metric),
+            ("Median total trial wall", _fmt_ms(details["median_total_elapsed_s"])),
+            (
+                "Median amortized throughput",
+                _fmt_optional_throughput(details["median_amortized_throughput"]),
+            ),
+            (
+                "Amortized 95% interval",
+                (
+                    f"[{details['ci_low_amortized_throughput']:,.1f}, "
+                    f"{details['ci_high_amortized_throughput']:,.1f}] samples/s"
+                    if details["ci_low_amortized_throughput"] is not None
+                    and details["ci_high_amortized_throughput"] is not None
+                    else "n/a"
+                ),
+            ),
+            ("Loader construction", _fmt_ms(details["median_construction_s"])),
+            ("Training setup", _fmt_ms(details["median_training_setup_s"])),
+            ("Iterator initialization", _fmt_ms(details["median_iterator_init_s"])),
+            ("First batch acquisition", _fmt_ms(details["median_first_batch_s"])),
+            ("Startup to first batch", _fmt_ms(details["median_startup_s"])),
+            ("Worker shutdown", _fmt_ms(details["median_worker_shutdown_s"])),
+            ("Loader cleanup", _fmt_ms(details["median_loader_cleanup_s"])),
+            ("CUDA execution", _fmt_ms(details["median_cuda_execution_s"])),
+            ("Device transfer", _fmt_ms(details["median_transfer_device_s"])),
+            ("Step device time", _fmt_ms(details["median_step_device_latency_s"])),
+        ]
+        body = "".join(
+            f"<tr><th>{escape(label)}</th><td>{escape(value)}</td></tr>" for label, value in rows
+        )
+        return (
+            "<section><h2>Timing Breakdown</h2>"
+            '<p class="muted">The total trial wall includes construction, every epoch '
+            "startup and shutdown, and final loader cleanup. Sustained throughput excludes "
+            "the first loader batch; amortized throughput uses the total wall.</p>"
+            f'<div class="table-wrap"><table class="kv"><tbody>{body}</tbody></table></div>'
+            "</section>"
+        )
+
+    def _comparability_html(self) -> str:
+        comparison = self.validation.comparability
+        escape = html.escape
+        if comparison is None:
+            return (
+                "<section><h2>Batch Comparability</h2>"
+                f"<p>No comparison was produced under the "
+                f"<code>{escape(self.settings.comparability_policy)}</code> policy.</p>"
+                "</section>"
+            )
+        rows = [
+            ("Status", comparison.status),
+            ("Confidence", comparison.confidence),
+            ("Compared rounds", str(comparison.rounds_compared)),
+            ("Rounds with fingerprints", str(comparison.rounds_with_fingerprints)),
+            ("Structural mismatch rounds", str(comparison.structural_mismatch_rounds)),
+            ("Different sample rounds", str(comparison.different_sample_rounds)),
+            (
+                "Structural identity",
+                "verified" if comparison.structural_verified else "not verified",
+            ),
+            (
+                "Sample identity",
+                "verified" if comparison.sample_identity_verified else "not verified",
+            ),
+            ("Sufficient for strict policy", "yes" if comparison.sufficient_for_strict else "no"),
+        ]
+        body = "".join(
+            f"<tr><th>{escape(label)}</th><td>{escape(value)}</td></tr>" for label, value in rows
+        )
+        notes = ""
+        if comparison.notes:
+            notes = (
+                "<ul>" + "".join(f"<li>{escape(note)}</li>" for note in comparison.notes) + "</ul>"
+            )
+        return (
+            "<section><h2>Batch Comparability</h2>"
+            f"<p>{escape(comparison.summary)}</p>"
+            f'<div class="table-wrap"><table class="kv"><tbody>{body}</tbody></table></div>'
+            f"{notes}</section>"
+        )
 
     def _batch_size_text(self) -> str:
         if self.loader_template is not None and self.loader_template.unbatched:

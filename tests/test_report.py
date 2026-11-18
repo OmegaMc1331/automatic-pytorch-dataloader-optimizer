@@ -53,11 +53,17 @@ def test_json_export(result, tmp_path: Path) -> None:
     result.to_json(target)
 
     payload = json.loads(target.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 3
-    assert payload["apdo_version"] == "0.3.0"
+    assert payload["schema_version"] == 4
+    assert payload["apdo_version"] == "0.4.0"
     assert payload["protocol"]["seed"] == 42
     assert payload["protocol"]["search_rounds"] == 3
     assert payload["recommended"]["config"]["num_workers"] == 1
+    assert "median_amortized_throughput" in payload["recommended"]
+    assert payload["protocol"]["timing_profile"] == "standard"
+    assert payload["protocol"]["selection_metric"] == "sustained"
+    assert payload["protocol"]["comparability_policy"] == "warn"
+    assert payload["timing"]["timing_profile"] == "standard"
+    assert payload["comparability"] is None
     assert payload["recommended"]["validation_status"] == "confirmed"
     assert payload["fastest"]["config"]["num_workers"] == 2
     assert payload["settings"]["batch_size"] == 8
@@ -135,7 +141,7 @@ def test_training_report_exposes_end_to_end_metrics(tmp_path: Path) -> None:
     html = target.read_text(encoding="utf-8")
     text = result.summary()
 
-    assert payload["schema_version"] == 3
+    assert payload["schema_version"] == 4
     assert payload["search"]["throughput_kind"] == "end_to_end_training"
     assert payload["training"]["epochs"] == 3
     assert payload["training"]["selected"]["summary"]["median_throughput"] == 120.0
