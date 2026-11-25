@@ -17,6 +17,7 @@ from apdo.optimizer import (
     _select_configuration,
     _Selection,
     _stage_one_configs,
+    _training_candidates,
     resolve_device,
 )
 from tests.datasets import RaisingDataset, SyntheticDataset
@@ -52,6 +53,50 @@ def test_finalist_workers_are_ranked_and_exclude_zero() -> None:
     ]
 
     assert _finalist_workers(measurements) == [2, 4]
+
+
+def _with_amortized(measurement, value: float):
+    summary = replace(
+        measurement.summary_or_raise(),
+        median_amortized_throughput=value,
+        ci_low_amortized_throughput=value,
+        ci_high_amortized_throughput=value,
+    )
+    return replace(measurement, summary=summary)
+
+
+def test_finalist_workers_follow_the_selected_metric() -> None:
+    measurements = [
+        _with_amortized(make_measurement(LoaderConfig(), (50.0, 50.0, 50.0)), 50.0),
+        _with_amortized(make_measurement(LoaderConfig(1), (80.0, 80.0, 80.0)), 800.0),
+        _with_amortized(make_measurement(LoaderConfig(2), (90.0, 90.0, 90.0)), 450.0),
+        _with_amortized(make_measurement(LoaderConfig(4), (100.0, 100.0, 100.0)), 200.0),
+    ]
+
+    assert _finalist_workers(measurements, "sustained") == [4, 2]
+    assert _finalist_workers(measurements, "amortized") == [1, 2]
+
+
+def test_training_candidates_follow_the_selected_metric() -> None:
+    measurements = [
+        _with_amortized(make_measurement(LoaderConfig(), (50.0, 50.0, 50.0)), 50.0),
+        _with_amortized(make_measurement(LoaderConfig(1), (80.0, 80.0, 80.0)), 800.0),
+        _with_amortized(make_measurement(LoaderConfig(2), (90.0, 90.0, 90.0)), 450.0),
+        _with_amortized(make_measurement(LoaderConfig(4), (100.0, 100.0, 100.0)), 200.0),
+    ]
+    baseline = measurements[0]
+    selection = _select_configuration(measurements, "amortized")
+
+    candidates = _training_candidates(
+        baseline=baseline,
+        selection=selection,
+        measurements=measurements,
+        limit=4,
+        selection_metric="amortized",
+    )
+
+    assert selection.selected.config == LoaderConfig(1)
+    assert candidates == [LoaderConfig(), LoaderConfig(1), LoaderConfig(2), LoaderConfig(4)]
 
 
 def test_selection_prefers_simple_when_intervals_overlap() -> None:
@@ -360,7 +405,11 @@ def test_partial_validation_budget_cannot_confirm_a_candidate(monkeypatch) -> No
     assert orders == ()
     assert result.status == "not_possible"
     assert not result.confirmed
-    assert result.observations == ()
+    assert result.validation_incomplete is True
+    assert result.completed_pairs == 3
+    assert result.valid_pairs == 3
+    assert result.observations != ()
+    assert result.improvement_percent == pytest.approx(100.0)
 
 
 def test_optimize_keeps_initial_configuration_without_validation() -> None:

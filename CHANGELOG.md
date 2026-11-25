@@ -2,6 +2,41 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.1] - 2026-11-25
+
+### Added
+
+- Exact one-sided paired sign test in validation, with `SIGN_TEST_EPSILON` handling so a gain exactly at the threshold is not counted as a success.
+- Explicit validation payload fields for planned, completed, and valid pairs, rejected observations with reasons, statistical constants, and the sign-test p-value.
+- Confirmed-only stability gain statistics, fallback counts, candidate agreement, and warning conditions for insufficient validation pairs, absent confirmed gains, and high agreement without evidence.
+- Multi-epoch loader support in the startup-bound workload through `--loader-epochs`.
+
+### Changed
+
+- Validation now requires at least eight valid paired observations and the sign test to pass in addition to the selected policy's observed-median and interval conditions.
+- Loader validation observations that are incomparable, incomplete, non-finite, or non-positive are rejected and reported instead of being replaced with zero gains.
+- A time budget that truncates validation before all planned pairs complete now retains the completed observations and records the validation as `not_possible` and incomplete.
+- Worker finalists, training candidates, search selection, ranking, report values, and HTML output now consistently use the selected `sustained` or `amortized` metric.
+- Default validation rounds increased from 5 to 10 for benchmark and stability runs and for the Python API.
+- Compute-bound benchmark now performs real MLP training over cheap input; startup-bound now exercises multiple loader epochs.
+- Stability reports distinguish confirmed gains from fallback or initial-configuration agreement and clarify that qualification describes validation coverage, not evidence strength.
+- Validation policy documentation now describes the exact sign test, invalid-observation handling, and the eight-pair minimum.
+
+### Fixed
+
+- Validation conclusions can no longer be confirmed from fewer than eight paired observations or from a failed sign test.
+- Sustained and amortized selection no longer diverge between finalist generation, training candidate selection, reporting, and ranking.
+- Budget-truncated validation no longer discards completed observations or substitutes zero gains.
+- Stability no longer presents high recommendation agreement as evidence when no run confirmed a gain.
+- The compute-bound and startup-bound workloads now measure the behavior their descriptions claim.
+
+### Known limitations
+
+- The sign test is exact and conservative for small samples; eight successes out of ten observations cannot reach `p < 0.05`.
+- A single strong outlier can move the observed median gain and bootstrap interval; the sign test counters this but can make the result inconclusive rather than confirmed.
+- The memory limit remains sampled and advisory.
+- macOS is not covered by CI in this release.
+
 ## [0.4.0] - 2026-11-18
 
 ### Added

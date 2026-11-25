@@ -5,7 +5,7 @@ from typing import Any
 
 from apdo.errors import ConfigurationError
 
-BENCHMARK_PROTOCOL_VERSION = "4.0"
+BENCHMARK_PROTOCOL_VERSION = "4.1"
 BENCHMARK_MODES = ("loader", "training")
 VALIDATION_POLICIES = ("minimum", "positive")
 TIMING_PROFILES = ("standard", "detailed")
@@ -95,7 +95,7 @@ class BenchmarkSettings:
     cpu_count: int
     seed: int = 42
     rounds: int = 3
-    validation_rounds: int = 5
+    validation_rounds: int = 10
     min_improvement: float = 0.05
     validation_enabled: bool = True
     time_budget_s: float | None = None
@@ -106,7 +106,7 @@ class BenchmarkSettings:
     benchmark_mode: str = "loader"
     epochs: int = 1
     training_rounds: int = 2
-    training_validation_rounds: int = 3
+    training_validation_rounds: int = 10
     max_training_candidates: int = 3
     validation_policy: str = "minimum"
     reproducibility_status: str = "verified"

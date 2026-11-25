@@ -58,7 +58,7 @@ def test_version() -> None:
     completed = run_cli("--version")
 
     assert completed.returncode == 0
-    assert "apdo 0.4.0" in completed.stdout
+    assert "apdo 0.4.1" in completed.stdout
 
 
 def test_no_command_prints_help() -> None:

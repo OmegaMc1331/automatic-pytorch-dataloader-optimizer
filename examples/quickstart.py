@@ -20,7 +20,7 @@ def main() -> None:
         max_ram_gb=2,
         max_batches=50,
         rounds=3,
-        validation_rounds=5,
+        validation_rounds=10,
         max_workers=4,
         seed=42,
     )

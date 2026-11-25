@@ -16,14 +16,14 @@ DataLoader throughput depends on the dataset, storage, preprocessing cost, CPU t
 
 APDO runs the real loader, records repeated measurements, validates the search recommendation with fresh measurements, and retains the initial configuration when a gain is not confirmed. It does not estimate performance from hardware specifications and does not call a cloud service.
 
-## Features in v0.4.0
+## Features in v0.4.1
 
 - Optimizes a map-style dataset with a batch size, an existing `DataLoader`, or a config-aware loader factory.
 - Measures repeated epochs in one trial and reports iterator initialization, first-batch acquisition, worker shutdown, loader cleanup, epoch transitions, sustained throughput, and total trial wall separately.
 - Supports a detailed timing profile with CUDA Events around transfers and training steps without per-batch synchronization.
 - Supports an explicit amortized metric that divides all trial samples by the complete trial wall, including construction, startup, transitions, shutdown, and cleanup.
 - Records batch structure and optional sample fingerprints for paired comparability diagnostics under `off`, `warn`, or `strict` policies.
-- Provides repeated independent optimizations through `evaluate_stability` and `apdo stability`, retaining partial failures and summarizing recommendation agreement.
+- Provides repeated independent optimizations through `evaluate_stability` and `apdo stability`, retaining partial failures, separating confirmed gains from fallbacks, and summarizing recommendation agreement.
 - Supports end-to-end training mode with a user-supplied training-step factory covering forward, backward, and optimizer work.
 - Preserves the original loader's dataset, batch size, sampler, batch sampler, collate function, `drop_last`, timeout, worker initialization, generator, multiprocessing context, and `in_order` setting.
 - Changes only `num_workers`, `pin_memory`, `prefetch_factor`, and `persistent_workers`.
@@ -31,6 +31,8 @@ APDO runs the real loader, records repeated measurements, validates the search r
 - Runs seeded, balanced rounds and records the executed configuration order and every per-round measurement.
 - Reports worker PIDs, process RSS, data-wait time, host-to-device transfer time, training-step latency, and epoch-transition overhead.
 - Runs independent paired validation with a configurable `minimum` or `positive` policy instead of treating the search result as proof.
+- Requires at least eight valid paired observations, an exact one-sided paired sign test, and the selected policy's interval condition before confirming a gain.
+- Uses the selected metric consistently for worker finalists, training candidates, the search recommendation, and the report.
 - Falls back to the initial configuration unless validation confirms the required minimum gain.
 - Supports optional time budgets and custom sample counting for unusual collate functions.
 - Generates a schema-v4 JSON report and a self-contained HTML report with lifecycle timing, comparability, training metrics, reproducibility, validation, ranking, execution order, environment, method, and limitations.
@@ -38,10 +40,10 @@ APDO runs the real loader, records repeated measurements, validates the search r
 
 ## Installation
 
-v0.4.0 is distributed through GitHub Releases. PyPI publication is not part of this release.
+v0.4.1 is distributed through GitHub Releases. PyPI publication is not part of this release.
 
 ```bash
-pip install "git+https://github.com/OmegaMc1331/automatic-pytorch-dataloader-optimizer.git@v0.4.0"
+pip install "git+https://github.com/OmegaMc1331/automatic-pytorch-dataloader-optimizer.git@v0.4.1"
 ```
 
 For development from a clone:
@@ -76,7 +78,7 @@ result = optimize(
     batch_size=32,
     device="cpu",
     rounds=3,
-    validation_rounds=5,
+    validation_rounds=10,
     max_batches=50,
 )
 print(result.summary())
@@ -103,7 +105,7 @@ result = optimize(
     dataloader=original_loader,
     device="auto",
     rounds=3,
-    validation_rounds=5,
+    validation_rounds=10,
 )
 
 print(result.validation.status)
@@ -160,7 +162,7 @@ result = optimize(
     training_step_factory=create_training_step,
     rounds=3,
     training_rounds=2,
-    validation_rounds=5,
+    validation_rounds=10,
 )
 print(result.to_dict()["training"])
 print(result.best_config.describe())
@@ -224,15 +226,17 @@ Only `num_workers`, `pin_memory`, `prefetch_factor`, and `persistent_workers` va
 4. In training mode, stage 1 and stage 2 measure data loading with one epoch. The initial configuration, the fastest loader configuration, and the highest-ranked alternatives then run the user's training step for the requested number of epochs.
 5. Configurations are measured in seeded, balanced rounds. A discarded warmup round is followed by one measured pass per configuration per round. The executed order is recorded.
 6. Every cycle records iterator initialization, first-batch acquisition, execution, and worker shutdown; the complete trial wall also includes loader construction and final cleanup. Sustained throughput excludes the first loader batch, while the amortized metric uses total samples divided by the complete trial wall.
-7. Training mode ranks candidates by sustained end-to-end training throughput. The search recommendation is not based on loader-only throughput.
+7. Training mode ranks candidates by the selected end-to-end training metric, sustained by default. The search recommendation is not based on loader-only throughput.
 8. The initial and selected configurations are measured again in balanced paired rounds. Search measurements are not reused.
-9. A paired bootstrap interval of relative gains determines the validation status under the selected policy.
-10. Validation that is stopped by the time budget before all planned rounds complete cannot confirm the candidate; the initial configuration is retained.
+9. Observations that are structurally incomparable, incomplete, non-finite, or non-positive are excluded and reported; they are never replaced with zeros.
+10. A paired bootstrap interval and an exact one-sided paired sign test determine the validation status under the selected policy. At least eight valid pairs are required.
+11. Validation that is stopped by the time budget before all planned rounds complete cannot confirm the candidate; the initial configuration is retained. Validation that produces fewer than eight valid pairs is `not_possible`.
 
 ### Validation policies
 
 - `minimum` requires the observed median gain and the lower 95% interval bound to reach `min_improvement`. This is the default and guarantees the configured threshold at the lower interval bound.
 - `positive` requires the observed median gain to reach `min_improvement` and the interval to be strictly above zero. It allows a statistically positive gain that may not guarantee the full threshold.
+- Both policies also require the exact one-sided paired sign test to reject the null hypothesis at `alpha = 0.05`. A gain exactly at the threshold is counted as a failure for the sign test.
 
 ### Validation statuses
 
@@ -242,7 +246,7 @@ Only `num_workers`, `pin_memory`, `prefetch_factor`, and `persistent_workers` va
 | `inconclusive` | The candidate did not establish the required gain. The initial configuration is retained. |
 | `regression` | The candidate was slower in validation. The initial configuration is retained. |
 | `not_needed` | The search selected the initial configuration. |
-| `not_possible` | Validation was disabled, skipped by the time budget, failed, or had fewer than two paired rounds. The initial configuration is retained. |
+| `not_possible` | Validation was disabled, failed, had fewer than eight valid paired observations, or was stopped by the time budget before all planned pairs completed. The initial configuration is retained. |
 
 ## Important `optimize()` parameters
 
@@ -271,7 +275,7 @@ Only `num_workers`, `pin_memory`, `prefetch_factor`, and `persistent_workers` va
 | `max_workers` | available CPUs, up to 8 | Upper bound for the worker search. |
 | `seed` | `42` | Seed for execution order, RNG isolation, and bootstrap resampling. |
 | `validation` | `True` | Enables independent paired validation. |
-| `validation_rounds` | `5` | Paired rounds for validation. |
+| `validation_rounds` | `10` | Planned paired rounds for validation; at least eight valid pairs are required to confirm a gain. |
 | `min_improvement` | `0.05` | Required relative gain, as a fraction. |
 | `time_budget_s` | `None` | Approximate search budget, checked at round boundaries. |
 | `sample_count_fn` | `None` | Callable that returns the number of samples in a batch. |
@@ -287,7 +291,7 @@ apdo benchmark \
   --batch-size 32 \
   --device auto \
   --rounds 3 \
-  --validation-rounds 5 \
+  --validation-rounds 10 \
   --json report.json \
   --html report.html
 ```
@@ -299,7 +303,7 @@ apdo benchmark \
   --factory my_project.data:build_loader \
   --device auto \
   --rounds 3 \
-  --validation-rounds 5 \
+  --validation-rounds 10 \
   --json loader-report.json
 ```
 
@@ -350,14 +354,14 @@ Useful options:
 
 JSON reports use schema version 4 and include:
 
-- APDO version, start time, duration, protocol version, benchmark mode, epochs, seed, rounds, timing profile, selection metric, comparability policy, budget state, and executed search/validation orders.
+- APDO version, start time, duration, protocol version 4.1, benchmark mode, epochs, seed, rounds, timing profile, selection metric, comparability policy, budget state, and executed search/validation orders.
 - Lifecycle timing for construction, iterator initialization, first batch, worker shutdown, loader cleanup, total trial wall, sustained throughput, and amortized throughput.
 - Batch structure and optional sample-fingerprint comparability results.
 - Environment, benchmark settings, loader preservation details, reproducibility status and risks, method, and limitations.
 - Baseline, search recommendation, fastest configuration, final recommendation, validation status, policy, and final gain.
 - Per-configuration per-round metrics, per-epoch cycle metrics, aggregate summaries, and failures.
 - Training details with end-to-end throughput, step latency, data wait, transfer time, and selected configuration summaries.
-- Complete validation observations and bootstrap results.
+- Complete validation observations, rejected-observation reasons, planned and completed pair counts, bootstrap results, statistical constants, sign-test p-value, and sustained and amortized selection values.
 
 HTML reports are self-contained, contain no remote assets, escape benchmark data, and include dedicated recommendation-validation, comparability, timing-breakdown, training, and reproducibility sections.
 
@@ -378,8 +382,8 @@ The repository includes six deterministic local workloads designed for tuning se
 - `in-memory`: preloaded tensor features with light preprocessing.
 - `disk-backed`: generated local binary records with deterministic random access.
 - `cpu-heavy`: per-sample matrix operations that make worker parallelism visible.
-- `startup-bound`: trivial per-sample work so loader construction and worker startup dominate.
-- `compute-bound`: repeated matrix transforms that make CPU parallelism visible.
+- `startup-bound`: trivial per-sample work with multiple loader epochs so construction and worker startup dominate the trial.
+- `compute-bound`: a deterministic MLP forward pass, cross-entropy loss, backward pass, and optimizer step over cheap data, so compute rather than loading dominates.
 - `training`: a real MLP forward pass, cross-entropy loss, backward pass, and optimizer step.
 
 Run all workloads:
@@ -398,6 +402,12 @@ Training workload:
 
 ```bash
 python benchmarks/run_workloads.py --workload training --device cuda --epochs 3 --training-rounds 2
+```
+
+Startup-sensitive run with multiple loader epochs:
+
+```bash
+python benchmarks/run_workloads.py --workload startup-bound --epochs 1 --loader-epochs 4
 ```
 
 Generated data and reports are written to ignored directories under `benchmarks/.cache/` and `benchmarks/results/`. The workloads require no network access.
@@ -429,6 +439,7 @@ python -m twine check dist/*
 - v0.1.0 and v0.2.0 calls to `optimize(dataset, batch_size=...)` remain supported.
 - v0.3.0 adds training mode, loader factories, multi-epoch metrics, reproducibility reporting, and JSON schema version 3 with protocol version 3.0.
 - v0.4.0 adds explicit lifecycle timing, amortized selection, detailed CUDA timing, batch comparability diagnostics, stability reports, and JSON schema version 4 with protocol version 4.0.
+- v0.4.1 adds metric-consistent selection and ranking, the eight-pair validation minimum with an exact paired sign test, explicit rejection of invalid validation observations, complete budget-truncated validation evidence, corrected startup-bound and compute-bound workloads, and confirmed-versus-fallback stability statistics with protocol version 4.1.
 - The two-stage search, bootstrap selection, memory guard, CUDA transfer measurement, CLI, and reports remain available.
 - Only map-style datasets with `__len__` and `__getitem__` are supported.
 - Loader mode measures data loading; it does not measure model training. Training mode measures the user-supplied model step, so model architecture and device work affect the result.
@@ -453,7 +464,7 @@ report = evaluate_stability(
         batch_size=32,
         device="cpu",
         rounds=3,
-        validation_rounds=5,
+        validation_rounds=10,
         seed=seed,
     ),
     runs=5,
@@ -464,7 +475,9 @@ report.to_json("stability.json")
 report.to_html("stability.html")
 ```
 
-The stability report records each run's recommended configuration, validation status, gain, throughput, comparability status, and any failure. It summarizes coverage, recommendation agreement, best-configuration frequency, median gain with a bootstrap interval, throughput spread, and failure counts. Raw batch values are never stored.
+The stability report records each run's recommended configuration, search candidate, validation status, gain, throughput, comparability status, and any failure. It summarizes coverage, recommendation agreement, candidate agreement, best-configuration frequency, confirmed gain statistics, fallback counts, validation pair counts, throughput spread, and failure counts. Raw batch values are never stored.
+
+An agreement rate alone is not evidence of a speedup: a run that retains the initial configuration or falls back after failed validation still counts toward recommendation agreement. Confirmed gains are counted separately, fallback runs retain their search-candidate gain in `improvement_percent`, and confirmed-only statistics use `median_confirmed_gain_percent`. The report warns when successful runs had too few valid validation pairs, when no run confirmed a gain, or when high agreement comes from fallback or initial-configuration choices. Qualification `complete` means every successful run contributed at least eight valid validation pairs; it says nothing about the size or usefulness of those gains.
 
 CLI equivalent:
 

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from apdo.comparability import BatchObservations
+from apdo.config import SELECTION_METRICS
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,6 +305,54 @@ def bootstrap_median_ci(
 
     alpha = (1.0 - confidence) / 2.0
     return percentile(bootstrapped, alpha), percentile(bootstrapped, 1.0 - alpha)
+
+
+def validate_selection_metric(selection_metric: str) -> str:
+    if selection_metric not in SELECTION_METRICS:
+        raise ValueError(
+            f"selection_metric must be one of {SELECTION_METRICS}, got {selection_metric!r}"
+        )
+    return selection_metric
+
+
+def selection_metric_label(selection_metric: str) -> str:
+    if validate_selection_metric(selection_metric) == "amortized":
+        return "amortized throughput"
+    return "sustained throughput"
+
+
+def is_valid_throughput(value: float | None) -> bool:
+    return value is not None and math.isfinite(value) and value > 0.0
+
+
+def pass_selection_throughput(metrics: PassMetrics, selection_metric: str) -> float | None:
+    if validate_selection_metric(selection_metric) == "amortized":
+        return metrics.amortized_throughput
+    if metrics.sustained_throughput is not None:
+        return metrics.sustained_throughput
+    return metrics.throughput
+
+
+def selection_value(summary: MetricsSummary, selection_metric: str) -> float | None:
+    if validate_selection_metric(selection_metric) == "amortized":
+        return summary.median_amortized_throughput
+    if summary.median_sustained_throughput is not None:
+        return summary.median_sustained_throughput
+    return summary.median_throughput
+
+
+def selection_interval(
+    summary: MetricsSummary,
+    selection_metric: str,
+) -> tuple[float, float] | None:
+    if validate_selection_metric(selection_metric) == "amortized":
+        if (
+            summary.ci_low_amortized_throughput is None
+            or summary.ci_high_amortized_throughput is None
+        ):
+            return None
+        return summary.ci_low_amortized_throughput, summary.ci_high_amortized_throughput
+    return summary.ci_low_throughput, summary.ci_high_throughput
 
 
 def summarize_passes(

@@ -54,7 +54,7 @@ def test_json_export(result, tmp_path: Path) -> None:
 
     payload = json.loads(target.read_text(encoding="utf-8"))
     assert payload["schema_version"] == 4
-    assert payload["apdo_version"] == "0.4.0"
+    assert payload["apdo_version"] == "0.4.1"
     assert payload["protocol"]["seed"] == 42
     assert payload["protocol"]["search_rounds"] == 3
     assert payload["recommended"]["config"]["num_workers"] == 1
@@ -69,7 +69,12 @@ def test_json_export(result, tmp_path: Path) -> None:
     assert payload["settings"]["batch_size"] == 8
     assert payload["validation"]["status"] == "confirmed"
     assert payload["validation"]["candidate_config"]["num_workers"] == 1
-    assert len(payload["validation"]["observations"]) == 3
+    assert len(payload["validation"]["observations"]) == 10
+    assert payload["validation"]["valid_pairs"] == 10
+    assert payload["validation"]["minimum_required_pairs"] == 8
+    assert payload["protocol"]["minimum_confirmation_pairs"] == 8
+    assert payload["recommended"]["selection_metric"] == "sustained"
+    assert payload["recommended"]["selection_value"] == 100.0
     assert payload["failures"][0]["error_message"] == "<script>worker failed</script>"
     assert payload["warnings"] == ["Dataset warning <unsafe>"]
     assert len(payload["configurations"]) == 4

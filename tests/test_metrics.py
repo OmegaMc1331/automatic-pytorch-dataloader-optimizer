@@ -10,7 +10,9 @@ from apdo.metrics import (
     bootstrap_median_ci,
     mean,
     median,
+    pass_selection_throughput,
     percentile,
+    selection_value,
     stdev,
     summarize_passes,
 )
@@ -108,6 +110,25 @@ def test_pass_serialization() -> None:
     assert data["batches"] == 4
     assert data["median_latency_s"] == 0.02
     assert data["p95_latency_s"] == pytest.approx(0.029)
+
+
+def test_selection_helpers_prefer_sustained_values() -> None:
+    pass_metrics = PassMetrics(
+        startup_s=0.01,
+        steady_elapsed_s=1.0,
+        batches=4,
+        steady_samples=100,
+        throughput=100.0,
+        latencies_s=(0.01,),
+        sustained_throughput=125.0,
+        amortized_throughput=40.0,
+    )
+    summary = summarize_passes([pass_metrics])
+
+    assert pass_selection_throughput(pass_metrics, "sustained") == 125.0
+    assert pass_selection_throughput(pass_metrics, "amortized") == 40.0
+    assert selection_value(summary, "sustained") == 125.0
+    assert selection_value(summary, "amortized") == 40.0
 
 
 def test_cycle_summary_uses_sustained_and_training_signals() -> None:

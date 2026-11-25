@@ -13,8 +13,10 @@ from apdo._version import __version__
 from apdo.config import LoaderConfig
 from apdo.metrics import bootstrap_median_ci, median
 from apdo.optimizer import OptimizationResult
+from apdo.validation import MIN_CONFIRMATION_PAIRS
 
 STABILITY_SCHEMA_VERSION = 1
+MIN_STABILITY_RUNS = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +37,15 @@ class StabilityRun:
     error_type: str | None = None
     error_message: str | None = None
     summary_text: str | None = None
+    initial_config: LoaderConfig | None = None
+    selection_metric: str | None = None
+    validation_enabled: bool = False
+    valid_pairs: int | None = None
+    invalid_pairs: int | None = None
+    planned_pairs: int | None = None
+    statistical_p_value: float | None = None
+    search_improvement_percent: float | None = None
+    duration_s: float | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -44,20 +55,40 @@ class StabilityRun:
     def confirmed(self) -> bool:
         return self.validation_status == "confirmed"
 
+    @property
+    def fallback(self) -> bool:
+        return (
+            self.succeeded
+            and self.validation_status not in {"confirmed", "not_needed", None}
+            and self.recommended_config == self.initial_config
+            and self.search_candidate != self.initial_config
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "run_index": self.run_index,
             "seed": self.seed,
             "succeeded": self.succeeded,
             "confirmed": self.confirmed,
+            "fallback": self.fallback,
             "recommended_config": (
                 self.recommended_config.to_dict() if self.recommended_config is not None else None
             ),
             "search_candidate": (
                 self.search_candidate.to_dict() if self.search_candidate is not None else None
             ),
+            "initial_config": (
+                self.initial_config.to_dict() if self.initial_config is not None else None
+            ),
             "validation_status": self.validation_status,
+            "validation_enabled": self.validation_enabled,
+            "valid_pairs": self.valid_pairs,
+            "invalid_pairs": self.invalid_pairs,
+            "planned_pairs": self.planned_pairs,
+            "statistical_p_value": self.statistical_p_value,
+            "selection_metric": self.selection_metric,
             "improvement_percent": self.improvement_percent,
+            "search_improvement_percent": self.search_improvement_percent,
             "ci_low_percent": self.ci_low_percent,
             "ci_high_percent": self.ci_high_percent,
             "throughput_median": self.throughput_median,
@@ -65,6 +96,7 @@ class StabilityRun:
             "warning_count": self.warning_count,
             "comparability_status": self.comparability_status,
             "sample_fingerprint_verified": self.sample_fingerprint_verified,
+            "duration_s": self.duration_s,
             "error_type": self.error_type,
             "error_message": self.error_message,
             "summary": self.summary_text,
@@ -89,6 +121,16 @@ class StabilitySummary:
     throughput_max: float | None
     comparability_counts: tuple[tuple[str, int], ...]
     failure_counts: tuple[tuple[str, int], ...]
+    candidate_counts: tuple[tuple[str, int], ...] = ()
+    most_common_candidate: str | None = None
+    candidate_agreement_percent: float | None = None
+    fallback_count: int = 0
+    runs_with_validation: int = 0
+    runs_with_enough_pairs: int = 0
+    median_confirmed_gain_percent: float | None = None
+    confirmed_ci_low_percent: float | None = None
+    confirmed_ci_high_percent: float | None = None
+    qualification: str = "partial"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -100,14 +142,24 @@ class StabilitySummary:
             "recommendation_counts": dict(self.recommendation_counts),
             "most_common_recommendation": self.most_common_recommendation,
             "agreement_percent": self.agreement_percent,
+            "candidate_counts": dict(self.candidate_counts),
+            "most_common_candidate": self.most_common_candidate,
+            "candidate_agreement_percent": self.candidate_agreement_percent,
+            "fallback_count": self.fallback_count,
+            "runs_with_validation": self.runs_with_validation,
+            "runs_with_enough_pairs": self.runs_with_enough_pairs,
             "median_improvement_percent": self.median_improvement_percent,
             "ci_low_percent": self.ci_low_percent,
             "ci_high_percent": self.ci_high_percent,
+            "median_confirmed_gain_percent": self.median_confirmed_gain_percent,
+            "confirmed_ci_low_percent": self.confirmed_ci_low_percent,
+            "confirmed_ci_high_percent": self.confirmed_ci_high_percent,
             "median_throughput": self.median_throughput,
             "throughput_min": self.throughput_min,
             "throughput_max": self.throughput_max,
             "comparability_counts": dict(self.comparability_counts),
             "failure_counts": dict(self.failure_counts),
+            "qualification": self.qualification,
         }
 
 
@@ -141,6 +193,9 @@ class StabilityReport:
                 "runs_total": len(self.runs),
                 "runs_succeeded": self.summary.runs_succeeded,
                 "runs_failed": self.summary.runs_failed,
+                "minimum_runs_for_qualification": MIN_STABILITY_RUNS,
+                "minimum_confirmation_pairs": MIN_CONFIRMATION_PAIRS,
+                "qualification": self.summary.qualification,
             },
             "summary": self.summary.to_dict(),
             "runs": [run.to_dict() for run in self.runs],
@@ -167,17 +222,31 @@ class StabilityReport:
             f"  runs: {summary.runs_succeeded}/{summary.runs_total} succeeded, "
             f"{summary.runs_failed} failed, coverage {summary.coverage_percent:.1f}%",
             f"  confirmed gains: {summary.runs_confirmed}/{summary.runs_succeeded}",
+            f"  fallbacks to the initial configuration: {summary.fallback_count}",
+            f"  qualification: {summary.qualification}",
         ]
         if summary.most_common_recommendation is not None and summary.agreement_percent is not None:
             lines.append(
-                f"  agreement: {summary.agreement_percent:.1f}% for "
+                f"  recommendation agreement: {summary.agreement_percent:.1f}% for "
                 f"{summary.most_common_recommendation}"
+            )
+        if summary.most_common_candidate is not None and (
+            summary.candidate_agreement_percent is not None
+        ):
+            lines.append(
+                f"  candidate agreement: {summary.candidate_agreement_percent:.1f}% for "
+                f"{summary.most_common_candidate}"
             )
         if summary.median_improvement_percent is not None:
             interval = ""
             if summary.ci_low_percent is not None and summary.ci_high_percent is not None:
                 interval = f" [{summary.ci_low_percent:+.1f}%, {summary.ci_high_percent:+.1f}%]"
-            lines.append(f"  median gain: {summary.median_improvement_percent:+.1f}%{interval}")
+            lines.append(
+                f"  median observed gain (all validation outcomes): "
+                f"{summary.median_improvement_percent:+.1f}%{interval}"
+            )
+        if summary.median_confirmed_gain_percent is not None:
+            lines.append(f"  median confirmed gain: {summary.median_confirmed_gain_percent:+.1f}%")
         if summary.median_throughput is not None:
             lines.append(
                 f"  median throughput: {summary.median_throughput:,.1f} "
@@ -195,6 +264,10 @@ class StabilityReport:
         recommendation_rows = "".join(
             f"<tr><td>{escape(label)}</td><td>{count}</td></tr>"
             for label, count in summary.recommendation_counts
+        )
+        candidate_rows = "".join(
+            f"<tr><td>{escape(label)}</td><td>{count}</td></tr>"
+            for label, count in summary.candidate_counts
         )
         comparability_rows = "".join(
             f"<tr><td>{escape(label)}</td><td>{count}</td></tr>"
@@ -223,6 +296,9 @@ class StabilityReport:
                 f"<tr><td>{run.run_index}</td><td>{run.seed}</td>"
                 f"<td>{'yes' if run.succeeded else 'no'}</td>"
                 f"<td>{escape(run.validation_status or 'n/a')}</td>"
+                f"<td>{'yes' if run.fallback else 'no'}</td>"
+                f"<td>{run.valid_pairs if run.valid_pairs is not None else 'n/a'}"
+                f"/{run.planned_pairs if run.planned_pairs is not None else 'n/a'}</td>"
                 f"<td>{recommended}</td><td>{candidate}</td>"
                 f"<td>{gain}</td><td>{throughput}</td>"
                 f"<td>{escape(run.comparability_status or 'n/a')}</td>"
@@ -236,6 +312,7 @@ class StabilityReport:
             f"{summary.agreement_percent:.1f}%" if summary.agreement_percent is not None else "n/a"
         )
         gain = _fmt_percent(summary.median_improvement_percent)
+        confirmed_gain = _fmt_percent(summary.median_confirmed_gain_percent)
         interval = "n/a"
         if summary.ci_low_percent is not None and summary.ci_high_percent is not None:
             interval = f"[{summary.ci_low_percent:+.1f}%, {summary.ci_high_percent:+.1f}%]"
@@ -321,15 +398,20 @@ started {escape(self.started_at.isoformat())}, completed in {self.duration_s:.2f
 <div class="metric"><span>Succeeded</span>
 <strong>{summary.runs_succeeded}/{summary.runs_total}</strong></div>
 <div class="metric"><span>Confirmed gains</span><strong>{summary.runs_confirmed}</strong></div>
+<div class="metric"><span>Fallbacks</span><strong>{summary.fallback_count}</strong></div>
 <div class="metric"><span>Agreement</span><strong>{escape(agreement)}</strong></div>
-<div class="metric"><span>Median gain</span><strong>{escape(gain)}</strong></div>
+<div class="metric"><span>Observed median gain</span><strong>{escape(gain)}</strong></div>
+<div class="metric"><span>Confirmed median gain</span>
+<strong>{escape(confirmed_gain)}</strong></div>
 <div class="metric"><span>Gain interval</span><strong>{escape(interval)}</strong></div>
+<div class="metric"><span>Qualification</span><strong>{escape(summary.qualification)}</strong></div>
 </div>
 </header>
 <section>
 <h2>Independent runs</h2>
 <div class="table-wrap"><table>
 <thead><tr><th>Run</th><th>Seed</th><th>Succeeded</th><th>Validation</th>
+<th>Fallback</th><th>Valid/planned pairs</th>
 <th>Recommended</th><th>Search candidate</th><th>Gain</th>
 <th>Median throughput</th><th>Comparability</th><th>Failure</th></tr></thead>
 <tbody>{"".join(run_rows)}</tbody>
@@ -339,6 +421,11 @@ started {escape(self.started_at.isoformat())}, completed in {self.duration_s:.2f
 <h2>Recommendation frequency</h2>
 <div class="table-wrap"><table><thead><tr><th>Configuration</th><th>Runs</th></tr></thead>
 <tbody>{recommendation_rows}</tbody></table></div>
+</section>
+<section>
+<h2>Search candidate frequency</h2>
+<div class="table-wrap"><table><thead><tr><th>Configuration</th><th>Runs</th></tr></thead>
+<tbody>{candidate_rows}</tbody></table></div>
 </section>
 <section>
 <h2>Comparability status</h2>
@@ -402,16 +489,17 @@ def evaluate_stability(
         comparison = result.validation.comparability
         summary = result.best_summary
         recommendation = result.best_config
+        validation = result.validation
         records.append(
             StabilityRun(
                 run_index=index,
                 seed=seed,
                 recommended_config=recommendation,
                 search_candidate=result.search_candidate_config,
-                validation_status=result.validation.status,
-                improvement_percent=result.validation.improvement_percent,
-                ci_low_percent=result.validation.ci_low_percent,
-                ci_high_percent=result.validation.ci_high_percent,
+                validation_status=validation.status,
+                improvement_percent=validation.improvement_percent,
+                ci_low_percent=validation.ci_low_percent,
+                ci_high_percent=validation.ci_high_percent,
                 throughput_median=summary.median_throughput,
                 amortized_throughput=summary.median_amortized_throughput,
                 warning_count=len(result.warnings),
@@ -420,6 +508,15 @@ def evaluate_stability(
                     comparison is not None and comparison.sample_identity_verified
                 ),
                 summary_text=result.summary(),
+                initial_config=result.settings.initial_config,
+                selection_metric=result.settings.selection_metric,
+                validation_enabled=validation.enabled,
+                valid_pairs=validation.valid_pairs,
+                invalid_pairs=validation.invalid_pairs,
+                planned_pairs=validation.planned_pairs,
+                statistical_p_value=validation.statistical_p_value,
+                search_improvement_percent=result.search_improvement_percent,
+                duration_s=result.duration_s,
             )
         )
         _emit(
@@ -430,6 +527,43 @@ def evaluate_stability(
         )
         warnings.extend(f"run {index}: {warning}" for warning in result.warnings)
     summary = summarize_stability(records)
+    if summary.runs_succeeded < MIN_STABILITY_RUNS:
+        warnings.append(
+            f"Only {summary.runs_succeeded} independent optimizations succeeded; "
+            f"at least {MIN_STABILITY_RUNS} are required for a complete stability "
+            "qualification."
+        )
+    if summary.runs_succeeded and summary.runs_with_validation < summary.runs_succeeded:
+        warnings.append(
+            f"{summary.runs_succeeded - summary.runs_with_validation} successful runs "
+            "did not enable independent validation."
+        )
+    if summary.runs_succeeded and summary.runs_with_enough_pairs < summary.runs_succeeded:
+        warnings.append(
+            f"{summary.runs_succeeded - summary.runs_with_enough_pairs} successful runs "
+            f"had fewer than {MIN_CONFIRMATION_PAIRS} valid paired validation observations."
+        )
+    if summary.fallback_count:
+        warnings.append(
+            f"{summary.fallback_count} successful runs fell back to the initial "
+            "configuration because validation did not confirm the search candidate. "
+            "Recommendation agreement that counts fallbacks does not demonstrate a "
+            "stable optimization benefit."
+        )
+    if summary.runs_succeeded and summary.runs_confirmed == 0:
+        warnings.append(
+            "No independent optimization produced a confirmed gain; agreement reflects "
+            "fallback or initial-configuration choices rather than a validated speedup."
+        )
+    if (
+        summary.agreement_percent is not None
+        and summary.agreement_percent >= 80.0
+        and summary.runs_confirmed == 0
+    ):
+        warnings.append(
+            f"High recommendation agreement ({summary.agreement_percent:.1f}%) is not "
+            "evidence of improvement because no run confirmed a gain."
+        )
     return StabilityReport(
         runs=tuple(records),
         summary=summary,
@@ -444,15 +578,24 @@ def summarize_stability(records: Sequence[StabilityRun]) -> StabilitySummary:
     succeeded = [record for record in records if record.succeeded]
     failed = [record for record in records if not record.succeeded]
     recommendation_counts: Counter[str] = Counter()
+    candidate_counts: Counter[str] = Counter()
     for record in succeeded:
         if record.recommended_config is not None:
             recommendation_counts[record.recommended_config.describe()] += 1
+        if record.search_candidate is not None:
+            candidate_counts[record.search_candidate.describe()] += 1
     counts = tuple(recommendation_counts.most_common())
+    candidate_tuple = tuple(candidate_counts.most_common())
     agreement = None
     most_common = None
     if succeeded and recommendation_counts:
         most_common, most_common_count = counts[0]
         agreement = most_common_count / len(succeeded) * 100.0
+    candidate_agreement = None
+    most_common_candidate = None
+    if succeeded and candidate_counts:
+        most_common_candidate, candidate_count = candidate_tuple[0]
+        candidate_agreement = candidate_count / len(succeeded) * 100.0
     gains = [
         record.improvement_percent for record in succeeded if record.improvement_percent is not None
     ]
@@ -462,6 +605,22 @@ def summarize_stability(records: Sequence[StabilityRun]) -> StabilitySummary:
         ci_low, ci_high = bootstrap_median_ci(gains, confidence=0.95, resamples=4000, seed=0)
     elif len(gains) == 1:
         ci_low = ci_high = gains[0]
+    confirmed_gains = [
+        record.improvement_percent
+        for record in succeeded
+        if record.confirmed and record.improvement_percent is not None
+    ]
+    median_confirmed_gain = median(confirmed_gains) if confirmed_gains else None
+    confirmed_ci_low = confirmed_ci_high = None
+    if len(confirmed_gains) >= 2:
+        confirmed_ci_low, confirmed_ci_high = bootstrap_median_ci(
+            confirmed_gains,
+            confidence=0.95,
+            resamples=4000,
+            seed=0,
+        )
+    elif len(confirmed_gains) == 1:
+        confirmed_ci_low = confirmed_ci_high = confirmed_gains[0]
     throughputs = [
         record.throughput_median for record in succeeded if record.throughput_median is not None
     ]
@@ -472,6 +631,17 @@ def summarize_stability(records: Sequence[StabilityRun]) -> StabilitySummary:
     for record in failed:
         failure_counts[record.error_type or "unknown"] += 1
     total = len(records)
+    runs_with_validation = sum(1 for record in succeeded if record.validation_enabled)
+    runs_with_enough_pairs = sum(
+        1
+        for record in succeeded
+        if record.valid_pairs is not None and record.valid_pairs >= MIN_CONFIRMATION_PAIRS
+    )
+    complete = (
+        len(succeeded) >= MIN_STABILITY_RUNS
+        and runs_with_validation == len(succeeded)
+        and runs_with_enough_pairs == len(succeeded)
+    )
     return StabilitySummary(
         runs_total=total,
         runs_succeeded=len(succeeded),
@@ -489,6 +659,16 @@ def summarize_stability(records: Sequence[StabilityRun]) -> StabilitySummary:
         throughput_max=max(throughputs) if throughputs else None,
         comparability_counts=tuple(comparability_counts.most_common()),
         failure_counts=tuple(failure_counts.most_common()),
+        candidate_counts=candidate_tuple,
+        most_common_candidate=most_common_candidate,
+        candidate_agreement_percent=candidate_agreement,
+        fallback_count=sum(1 for record in succeeded if record.fallback),
+        runs_with_validation=runs_with_validation,
+        runs_with_enough_pairs=runs_with_enough_pairs,
+        median_confirmed_gain_percent=median_confirmed_gain,
+        confirmed_ci_low_percent=confirmed_ci_low,
+        confirmed_ci_high_percent=confirmed_ci_high,
+        qualification="complete" if complete else "partial",
     )
 
 

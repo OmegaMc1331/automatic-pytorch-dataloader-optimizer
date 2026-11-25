@@ -119,13 +119,13 @@ def make_settings(
         dataset_size=64,
         cpu_count=8,
         seed=42,
-        validation_rounds=5,
+        validation_rounds=10,
         min_improvement=0.05,
         validation_enabled=True,
         time_budget_s=None,
         initial_config=initial_config or LoaderConfig(),
         input_kind="dataset",
-        protocol_version="4.0",
+        protocol_version="4.1",
         expected_batches=8,
     )
 
@@ -133,7 +133,7 @@ def make_settings(
 def make_validation(
     baseline: LoaderConfig | None = None,
     candidate: LoaderConfig | None = None,
-    gains: tuple[float, ...] = (0.25, 0.25, 0.25),
+    gains: tuple[float, ...] = (0.25,) * 10,
     *,
     enabled: bool = True,
     min_improvement: float = 0.05,
@@ -155,6 +155,7 @@ def make_validation(
         enabled=enabled,
         min_improvement=min_improvement,
         seed=13,
+        planned_pairs=len(gains),
     )
 
 

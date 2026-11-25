@@ -158,8 +158,8 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument(
         "--validation-rounds",
         type=_at_least_two,
-        default=5,
-        help="independent paired validation rounds (default: 5)",
+        default=10,
+        help="independent paired validation rounds (default: 10; at least 8 valid pairs needed)",
     )
     benchmark.add_argument(
         "--min-improvement",
@@ -309,7 +309,7 @@ def build_parser() -> argparse.ArgumentParser:
     stability.add_argument("--max-ram-gb", type=_positive_float, default=None)
     stability.add_argument("--warmup-runs", type=_positive_int, default=1)
     stability.add_argument("--rounds", type=_at_least_two, default=3)
-    stability.add_argument("--validation-rounds", type=_at_least_two, default=5)
+    stability.add_argument("--validation-rounds", type=_at_least_two, default=10)
     stability.add_argument("--min-improvement", type=_fraction, default=0.05)
     stability.add_argument("--max-workers", type=_positive_int, default=None)
     stability.add_argument("--max-batches", type=_at_least_two, default=100)

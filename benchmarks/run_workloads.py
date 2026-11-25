@@ -7,9 +7,9 @@ from pathlib import Path
 from apdo import optimize
 
 try:
-    from benchmarks.workloads import build_training_step_factory, build_workload
+    from benchmarks.workloads import build_workload_spec
 except ModuleNotFoundError:
-    from workloads import build_training_step_factory, build_workload
+    from workloads import build_workload_spec
 
 WORKLOADS = (
     "in-memory",
@@ -23,7 +23,7 @@ WORKLOADS = (
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run the six APDO v0.4.0 workloads and write JSON/HTML reports."
+        description="Run the six APDO v0.4.1 workloads and write JSON/HTML reports."
     )
     parser.add_argument(
         "--workload",
@@ -45,8 +45,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--validation-rounds",
         type=int,
-        default=5,
-        help="independent validation rounds (default: 5)",
+        default=10,
+        help="independent validation rounds (default: 10; at least 8 valid pairs needed)",
     )
     parser.add_argument(
         "--max-workers",
@@ -67,10 +67,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="epochs per training trial (default: 3)",
     )
     parser.add_argument(
+        "--loader-epochs",
+        type=int,
+        default=None,
+        help="epochs per loader trial (default: 1; set this for multi-epoch qualification)",
+    )
+    parser.add_argument(
         "--training-rounds",
         type=int,
         default=2,
         help="measured training finalist rounds (default: 2)",
+    )
+    parser.add_argument(
+        "--selection-metric",
+        choices=("sustained", "amortized"),
+        default="sustained",
+        help="metric used for search, ranking, and validation (default: sustained)",
+    )
+    parser.add_argument(
+        "--timing-profile",
+        choices=("standard", "detailed"),
+        default="standard",
+        help="timing profile (default: standard)",
+    )
+    parser.add_argument(
+        "--comparability-policy",
+        choices=("off", "warn", "strict"),
+        default="warn",
+        help="batch comparability policy (default: warn)",
+    )
+    parser.add_argument(
+        "--no-validation",
+        dest="validation",
+        action="store_false",
+        help="skip independent validation (smoke tests only; gains cannot be confirmed)",
     )
     parser.add_argument(
         "--cache-directory",
@@ -85,6 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="directory for JSON and HTML reports",
     )
     parser.add_argument("--seed", type=int, default=42, help="execution seed (default: 42)")
+    parser.set_defaults(validation=True)
     return parser
 
 
@@ -95,32 +126,33 @@ def main() -> int:
     summaries = []
 
     for name in names:
-        dataset, batch_size, workload_batches = build_workload(name, args.cache_directory)
-        max_batches = args.max_batches or workload_batches
-        training = name == "training"
+        spec = build_workload_spec(name, args.cache_directory, device=args.device)
+        max_batches = args.max_batches or spec.max_batches
+        training = spec.mode == "training"
+        epochs = args.epochs if training else (args.loader_epochs or 1)
         print(
-            f"\n=== {name}: {len(dataset)} samples, batch_size={batch_size}, "
-            f"mode={'training' if training else 'loader'} ===",
+            f"\n=== {name}: {len(spec.dataset)} samples, batch_size={spec.batch_size}, "
+            f"mode={spec.mode}, epochs={epochs} ===",
             flush=True,
         )
         result = optimize(
-            dataset,
-            batch_size=batch_size,
+            spec.dataset,
+            batch_size=spec.batch_size,
             device=args.device,
-            mode="training" if training else "loader",
-            epochs=args.epochs if training else 1,
-            training_step_factory=(build_training_step_factory(args.device) if training else None),
+            mode=spec.mode,
+            epochs=epochs,
+            training_step_factory=spec.training_step_factory,
             training_rounds=args.training_rounds,
             training_validation_rounds=args.validation_rounds,
             max_batches=max_batches,
             rounds=args.rounds,
-            validation=True,
+            validation=args.validation,
             validation_rounds=args.validation_rounds,
             max_workers=args.max_workers,
             seed=args.seed,
-            timing_profile="standard",
-            selection_metric="sustained",
-            comparability_policy="warn",
+            timing_profile=args.timing_profile,
+            selection_metric=args.selection_metric,
+            comparability_policy=args.comparability_policy,
             progress=lambda message: print(message, flush=True),
         )
         json_path = args.output_directory / f"{name}.json"
@@ -135,14 +167,28 @@ def main() -> int:
                 "workload": name,
                 "mode": result.settings.benchmark_mode,
                 "epochs": result.settings.epochs,
-                "samples": len(dataset),
-                "batch_size": batch_size,
+                "samples": len(spec.dataset),
+                "batch_size": spec.batch_size,
                 "batches_per_epoch": max_batches,
                 "recommended": result.best_config.describe(),
+                "selection_metric": result.settings.selection_metric,
                 "validation_status": result.validation.status,
                 "validation_improvement_percent": result.validation.improvement_percent,
+                "validation_ci_low_percent": result.validation.ci_low_percent,
+                "validation_ci_high_percent": result.validation.ci_high_percent,
+                "validation_valid_pairs": result.validation.valid_pairs,
+                "validation_invalid_pairs": result.validation.invalid_pairs,
+                "validation_completed_pairs": result.validation.completed_pairs,
+                "validation_planned_pairs": result.validation.planned_pairs,
+                "validation_statistical_p_value": result.validation.statistical_p_value,
+                "validation_incomplete": result.validation.validation_incomplete,
                 "search_improvement_percent": result.search_improvement_percent,
                 "median_throughput": result.best_summary.median_throughput,
+                "selection_value": (
+                    result.best_summary.median_amortized_throughput
+                    if result.settings.selection_metric == "amortized"
+                    else result.best_summary.median_throughput
+                ),
                 "throughput_kind": ("end_to_end_training" if training else "loader"),
                 "baseline_throughput": result.baseline_throughput,
                 "median_sustained_throughput": result.best_summary.median_sustained_throughput,

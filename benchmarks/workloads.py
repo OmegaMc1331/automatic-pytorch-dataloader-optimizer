@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from array import array
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
 from torch import nn
 from torch.utils.data import Dataset
+
+from apdo.training import TrainingStepFactory
 
 
 class InMemoryDataset(Dataset):
@@ -150,26 +153,41 @@ def build_training_step_factory(
     return factory
 
 
+def build_compute_bound_training_step_factory(
+    device: str | torch.device,
+    *,
+    feature_dim: int = 128,
+) -> Callable[[], Callable[[Any], None]]:
+    resolved_device = torch.device(device)
+    hidden_dim = 1024 if resolved_device.type == "cuda" else 512
+    return build_training_step_factory(
+        resolved_device,
+        feature_dim=feature_dim,
+        hidden_dim=hidden_dim,
+    )
+
+
 class ComputeBoundDataset(Dataset):
-    def __init__(self, size: int = 512, feature_dim: int = 128) -> None:
+    def __init__(self, size: int = 4096, feature_dim: int = 128) -> None:
         generator = torch.Generator().manual_seed(2030)
         self.features = torch.randn(size, feature_dim, generator=generator)
         self.labels = torch.randint(0, 10, (size,), generator=generator)
-        self.matrices = tuple(
-            torch.randn(feature_dim, feature_dim, generator=generator) / feature_dim**0.5
-            for _ in range(3)
-        )
 
     def __len__(self) -> int:
         return len(self.labels)
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
-        features = self.features[index]
-        for matrix in self.matrices:
-            features = torch.matmul(features, matrix)
-            features = torch.tanh(features)
-            features = features / (1.0 + features.abs())
-        return features, self.labels[index]
+        return self.features[index], self.labels[index]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkloadSpec:
+    name: str
+    dataset: Dataset
+    batch_size: int
+    max_batches: int
+    mode: str
+    training_step_factory: TrainingStepFactory | None = None
 
 
 def build_workload(
@@ -186,10 +204,62 @@ def build_workload(
     if name == "startup-bound":
         return StartupBoundDataset(), 32, 80
     if name == "compute-bound":
-        return ComputeBoundDataset(), 16, 12
+        return ComputeBoundDataset(), 64, 32
     if name == "training":
         return InMemoryDataset(), 32, 20
     raise ValueError(
         f"unknown workload {name!r}; expected in-memory, disk-backed, cpu-heavy, "
         "startup-bound, compute-bound, or training"
     )
+
+
+def build_workload_spec(
+    name: str,
+    cache_directory: Path,
+    *,
+    device: str | torch.device = "cpu",
+) -> WorkloadSpec:
+    dataset, batch_size, max_batches = build_workload(name, cache_directory)
+    if name == "compute-bound":
+        return WorkloadSpec(
+            name=name,
+            dataset=dataset,
+            batch_size=batch_size,
+            max_batches=max_batches,
+            mode="training",
+            training_step_factory=build_compute_bound_training_step_factory(device),
+        )
+    if name == "training":
+        return WorkloadSpec(
+            name=name,
+            dataset=dataset,
+            batch_size=batch_size,
+            max_batches=max_batches,
+            mode="training",
+            training_step_factory=build_training_step_factory(
+                device,
+                feature_dim=64,
+                hidden_dim=256,
+            ),
+        )
+    return WorkloadSpec(
+        name=name,
+        dataset=dataset,
+        batch_size=batch_size,
+        max_batches=max_batches,
+        mode="loader",
+    )
+
+
+def create_cpu_heavy_dataset() -> Dataset:
+    return CpuHeavyDataset()
+
+
+def create_compute_bound_dataset() -> Dataset:
+    return ComputeBoundDataset()
+
+
+def create_compute_bound_training_step(
+    device: str | torch.device = "cpu",
+) -> TrainingStepFactory:
+    return build_compute_bound_training_step_factory(device)

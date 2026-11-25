@@ -13,14 +13,18 @@ from apdo._version import __version__
 from apdo.benchmark import ConfigMeasurement
 from apdo.config import BenchmarkSettings, LoaderConfig
 from apdo.loader import LoaderSource, LoaderTemplate
-from apdo.metrics import MetricsSummary
+from apdo.metrics import (
+    MetricsSummary,
+    selection_metric_label,
+    selection_value,
+)
 from apdo.order import RoundOrder
 from apdo.resources import EnvironmentInfo
-from apdo.validation import ValidationResult
+from apdo.validation import MIN_CONFIRMATION_PAIRS, STATISTICAL_ALPHA, ValidationResult
 
 METHOD = {
     "protocol": (
-        "Benchmark protocol 4.0. Search configurations run in loaded, seeded, balanced "
+        "Benchmark protocol 4.1. Search configurations run in loaded, seeded, balanced "
         "rounds. Loader trials reuse one DataLoader across the configured epochs; each "
         "trial is wrapped in global RNG state isolation. Training mode adds an explicit "
         "end-to-end finalist stage. Iterator initialization, first-batch acquisition, "
@@ -33,26 +37,32 @@ METHOD = {
         "remaining configurations up to the configured limit."
     ),
     "selection_metric": (
-        "Loader mode uses median sustained loader throughput across balanced rounds. "
-        "Training mode selects on median sustained end-to-end training throughput."
+        "The configured selection metric is sustained throughput by default or amortized "
+        "total-trial throughput when requested. The same metric ranks loader candidates, "
+        "training finalists, report rankings, and validation gains."
     ),
     "uncertainty": (
         "95% percentile bootstrap interval of the median throughput from measured "
-        "rounds. Validation uses a paired bootstrap interval of per-round relative gains."
+        "rounds. Validation uses a paired bootstrap interval of per-round relative gains "
+        "and an exact one-sided paired sign test."
     ),
     "selection_rule": (
-        "The search favors the simplest configuration whose median throughput is within "
+        "The search favors the simplest configuration whose selected metric is within "
         "5% of the fastest and whose bootstrap interval overlaps the fastest interval. "
-        "The search candidate then faces independent paired validation. A candidate is "
-        "recommended only if the observed median reaches the configured minimum and the "
-        "chosen validation policy is satisfied: by default the lower 95% bound must reach "
-        "the minimum; the positive policy requires only an interval strictly above zero."
+        f"The search candidate then faces at least {MIN_CONFIRMATION_PAIRS} valid fresh "
+        "paired validation rounds. A candidate is recommended only if the observed median "
+        "reaches the configured minimum, the chosen validation policy is satisfied, and "
+        "an exact one-sided paired sign test returns a p-value below "
+        f"{STATISTICAL_ALPHA:.2f}. By default the lower 95% bound must also reach the "
+        "minimum; the positive policy requires only an interval strictly above zero."
     ),
     "validation": (
         "Validation uses fresh measurements, not search results. The initial and candidate "
-        "configurations run in alternating balanced order for the configured validation "
-        "rounds. The paired relative throughput gains are summarized by their median and a "
-        "95% percentile bootstrap interval."
+        f"configurations run in alternating balanced order for at least "
+        f"{MIN_CONFIRMATION_PAIRS} valid paired rounds by default. Invalid observations "
+        "are excluded and reported; paired relative throughput gains are summarized by "
+        "their median, a 95% percentile bootstrap interval, and an exact one-sided paired "
+        "sign test."
     ),
     "throughput_scope": (
         "Loader mode measures data loading plus host-to-device tensor copies when the "
@@ -79,8 +89,14 @@ LIMITATIONS = (
     "Supported generator, sampler, batch-sampler, and global RNG state are isolated per "
     "trial. Undetected mutable state inside arbitrary datasets, transforms, collate "
     "functions, worker_init_fn, or user factories can still reduce comparability.",
-    "Confidence intervals reflect variation across rounds only. Validation intervals are "
-    "paired percentile bootstrap intervals, not universal guarantees or formal proof.",
+    "Confidence intervals reflect variation across rounds only. A sign test assumes "
+    "independent paired rounds from the measured process; it is not a universal guarantee "
+    "or formal proof of future performance.",
+    "Validation requires at least eight valid paired rounds for confirmation. Shorter "
+    "experiments are mechanism checks; they cannot confirm a candidate.",
+    "High recommendation agreement across independent stability runs does not by itself "
+    "demonstrate that the workload is stable. Runs that fall back to the initial "
+    "configuration are reported separately.",
     "APDO supports standard map-style DataLoaders with finite samplers and an explicit "
     "dataloader_factory contract for pipelines that need independent construction.",
     "Process RSS covers the parent process and is absolute, so it can include memory "
@@ -157,6 +173,19 @@ class OptimizationResult:
         validation = self.validation
         gain_text = _fmt_percent(validation.improvement_percent)
         interval_text = _fmt_interval(validation)
+        selection_metric = self.settings.selection_metric
+        selection_label = selection_metric_label(selection_metric)
+        selected_value = selection_value(summary, selection_metric)
+        selected_value_text = (
+            f"{selected_value:,.1f} {throughput_label}" if selected_value is not None else "n/a"
+        )
+        statistical_text = (
+            f"p={validation.statistical_p_value:.4f} "
+            f"(alpha {validation.statistical_alpha:.2f}, "
+            f"{validation.sign_test_successes}/{validation.valid_pairs} rounds)"
+            if validation.statistical_p_value is not None
+            else "n/a"
+        )
         if validation.confirmed:
             improvement = f"validated gain: {gain_text} ({interval_text})"
         else:
@@ -166,12 +195,17 @@ class OptimizationResult:
             "Recommended DataLoader configuration",
             f"  {self.best_config.describe()}",
             f"  benchmark mode: {self.settings.benchmark_mode}; epochs: {self.settings.epochs}",
+            f"  selection metric: {selection_label} ({selected_value_text})",
             "",
             "Recommendation validation",
             f"  status: {validation.status}",
             f"  initial configuration: {validation.baseline_config.describe()}",
             f"  search candidate: {validation.candidate_config.describe()}",
             f"  observed median change: {gain_text} ({interval_text})",
+            f"  evidence: {validation.valid_pairs} valid of {validation.completed_pairs} "
+            f"completed pairs ({validation.invalid_pairs} invalid); minimum "
+            f"{validation.minimum_required_pairs}; planned {validation.planned_pairs}",
+            f"  statistical test: {validation.statistical_method}; {statistical_text}",
             f"  decision: {validation.reason}",
             "",
             "Measured performance",
@@ -309,6 +343,9 @@ class OptimizationResult:
                 "training_rounds": self.settings.training_rounds,
                 "training_validation_rounds": self.settings.training_validation_rounds,
                 "max_training_candidates": self.settings.max_training_candidates,
+                "minimum_confirmation_pairs": MIN_CONFIRMATION_PAIRS,
+                "statistical_method": self.validation.statistical_method,
+                "statistical_alpha": self.validation.statistical_alpha,
                 "time_budget_s": self.settings.time_budget_s,
                 "budget_exhausted": self.budget_exhausted,
                 "measured_orders": measured_orders,
@@ -331,6 +368,15 @@ class OptimizationResult:
                 "median_throughput": self._search_measurement_for(self.search_candidate_config)
                 .summary_or_raise()
                 .median_throughput,
+                "median_amortized_throughput": self._search_measurement_for(
+                    self.search_candidate_config
+                )
+                .summary_or_raise()
+                .median_amortized_throughput,
+                "selection_metric": self.settings.selection_metric,
+                "selection_value": self._selection_value_for(
+                    self._search_measurement_for(self.search_candidate_config)
+                ),
                 "throughput_kind": (
                     "end_to_end_training"
                     if self.settings.benchmark_mode == "training"
@@ -352,6 +398,8 @@ class OptimizationResult:
                 "median_sustained_throughput": final_summary.median_sustained_throughput,
                 "median_amortized_throughput": final_summary.median_amortized_throughput,
                 "median_total_elapsed_s": final_summary.median_total_elapsed_s,
+                "selection_metric": self.settings.selection_metric,
+                "selection_value": self._selection_value_for(final_measurement),
                 "throughput_kind": (
                     "end_to_end_training"
                     if self.settings.benchmark_mode == "training"
@@ -418,11 +466,17 @@ class OptimizationResult:
             )
         ]
         if matches:
-            return max(matches, key=lambda item: item.summary.median_throughput)
+            return max(matches, key=self._selection_value_for)
         if required:
             phase = "training " if expected_training else ""
             raise ValueError(f"no completed {phase}measurement for {config.describe()}")
         return None
+
+    def _selection_value_for(self, measurement: ConfigMeasurement) -> float:
+        if measurement.summary is None:
+            return 0.0
+        value = selection_value(measurement.summary, self.settings.selection_metric)
+        return value if value is not None else 0.0
 
     def _ranked_successes(self) -> list[ConfigMeasurement]:
         training = self.settings.benchmark_mode == "training"
@@ -431,10 +485,7 @@ class OptimizationResult:
             for item in self.measurements
             if item.succeeded and item.summary is not None and item.training == training
         ]
-        ranked.sort(
-            key=lambda item: item.summary.median_throughput if item.summary else 0.0,
-            reverse=True,
-        )
+        ranked.sort(key=self._selection_value_for, reverse=True)
         return ranked
 
     def _html(self) -> str:
@@ -456,6 +507,10 @@ class OptimizationResult:
             (
                 "Median training throughput" if training else "Median throughput",
                 f"{best.median_throughput:,.1f} {throughput_label}",
+            ),
+            (
+                f"Selected {selection_metric_label(self.settings.selection_metric)}",
+                _fmt_optional_throughput(selection_value(best, self.settings.selection_metric)),
             ),
             ("Median batch latency", _fmt_ms(best.median_latency_s)),
             ("p95 batch latency", _fmt_ms(best.p95_latency_s)),
@@ -514,10 +569,13 @@ class OptimizationResult:
             gpu_cell = ""
             if device_is_cuda:
                 gpu_cell = f"<td>{_fmt_mib(summary.peak_gpu_memory_bytes)}</td>"
+            selected = selection_value(summary, self.settings.selection_metric)
             rows.append(
                 f'<tr{row_class}><td class="rank">{rank}</td>'
                 f"<td><code>{escape(measurement.config.describe())}</code></td>"
                 f"<td>{summary.median_throughput:,.1f}</td>"
+                f"<td>{_fmt_optional_throughput(selected)}</td>"
+                f"<td>{_fmt_optional_throughput(summary.median_amortized_throughput)}</td>"
                 f"<td>{summary.cv_throughput * 100:.1f}%</td>"
                 f"<td>{_fmt_ms(summary.median_latency_s)}</td>"
                 f"<td>{_fmt_ms(summary.p95_latency_s)}</td>"
@@ -690,7 +748,8 @@ mode {escape(self.settings.benchmark_mode)} &middot;
 <div class="table-wrap">
 <table>
 <thead><tr>
-<th>Rank</th><th>Configuration</th><th>Median samples/s</th><th>CV</th>
+<th>Rank</th><th>Configuration</th><th>Median sustained</th>
+<th>Selected metric</th><th>Median amortized</th><th>CV</th>
 <th>Median batch</th><th>p95 batch</th><th>Startup</th><th>Peak RSS</th>{gpu_header}
 </tr></thead>
 <tbody>{"".join(rows)}</tbody>
@@ -752,41 +811,59 @@ requires no network access. Throughput is {escape(throughput_label)} in
     def _validation_html(self) -> str:
         escape = html.escape
         validation = self.validation
-        throughput_label = (
-            "training samples/s" if self.settings.benchmark_mode == "training" else "samples/s"
-        )
-        baseline_median = (
-            f"{validation.baseline_summary.median_throughput:,.1f} {throughput_label}"
+        metric_label = selection_metric_label(validation.selection_metric)
+        baseline_selected = (
+            selection_value(validation.baseline_summary, validation.selection_metric)
             if validation.baseline_summary is not None
-            else "n/a"
+            else None
         )
-        candidate_median = (
-            f"{validation.candidate_summary.median_throughput:,.1f} {throughput_label}"
+        candidate_selected = (
+            selection_value(validation.candidate_summary, validation.selection_metric)
             if validation.candidate_summary is not None
-            else "n/a"
+            else None
         )
+        baseline_median = _fmt_optional_throughput(baseline_selected)
+        candidate_median = _fmt_optional_throughput(candidate_selected)
         rows = []
         for observation in validation.observations:
+            data = observation.to_dict(validation.selection_metric)
+            baseline_value = data["baseline_selection_throughput"]
+            candidate_value = data["candidate_selection_throughput"]
+            gain_value = data["gain_selection_percent"]
             rows.append(
                 f"<tr><td>{observation.round_index + 1}</td>"
-                f"<td>{observation.baseline.throughput:,.1f}</td>"
-                f"<td>{observation.candidate.throughput:,.1f}</td>"
-                f"<td>{observation.gain * 100:+.1f}%</td></tr>"
+                f"<td>{_fmt_optional_throughput(baseline_value)}</td>"
+                f"<td>{_fmt_optional_throughput(candidate_value)}</td>"
+                f"<td>{_fmt_percent(gain_value)}</td>"
+                f"<td>{'yes' if data['valid'] else 'no'}</td>"
+                f"<td>{escape(data['validity_reason'] or '')}</td></tr>"
             )
         observations_html = ""
         if rows:
             observations_html = (
                 '<div class="table-wrap"><table><thead><tr>'
-                f"<th>Round</th><th>Baseline {escape(throughput_label)}</th>"
-                f"<th>Candidate {escape(throughput_label)}</th>"
-                "<th>Paired gain</th></tr></thead><tbody>"
-                + "".join(rows)
-                + "</tbody></table></div>"
+                f"<th>Round</th><th>Baseline {escape(metric_label)}</th>"
+                f"<th>Candidate {escape(metric_label)}</th>"
+                "<th>Paired gain</th><th>Valid</th><th>Rejection reason</th>"
+                "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>"
             )
+        rejections_html = ""
+        if validation.invalid_reasons:
+            rejection_items = "\n".join(
+                f"<li>{escape(item)}</li>" for item in validation.invalid_reasons
+            )
+            rejections_html = f"<h3>Rejected observations</h3><ul>{rejection_items}</ul>"
         failures_html = ""
         if validation.failures:
             failure_items = "\n".join(f"<li>{escape(item)}</li>" for item in validation.failures)
             failures_html = f"<h3>Validation failures</h3><ul>{failure_items}</ul>"
+        statistical_text = (
+            f"{validation.statistical_method}, alpha {validation.statistical_alpha:.2f}; "
+            f"{validation.sign_test_successes}/{validation.valid_pairs} successful pairs; "
+            f"p={validation.statistical_p_value:.4f}"
+            if validation.statistical_p_value is not None
+            else f"{validation.statistical_method}; no valid paired sample"
+        )
 
         search_note = ""
         if self.search_candidate_config != self.best_config:
@@ -805,23 +882,35 @@ requires no network access. Throughput is {escape(throughput_label)} in
 <strong><code>{escape(validation.baseline_config.describe())}</code></strong></div>
 <div class="metric"><span>Search candidate</span>
 <strong><code>{escape(validation.candidate_config.describe())}</code></strong></div>
-<div class="metric"><span>Initial median</span><strong>{escape(baseline_median)}</strong></div>
-<div class="metric"><span>Candidate median</span><strong>{escape(candidate_median)}</strong></div>
+<div class="metric"><span>Initial {escape(metric_label)}</span>
+<strong>{escape(baseline_median)}</strong></div>
+<div class="metric"><span>Candidate {escape(metric_label)}</span>
+<strong>{escape(candidate_median)}</strong></div>
 <div class="metric"><span>Observed gain</span>
 <strong>{escape(_fmt_percent(validation.improvement_percent))}</strong></div>
 <div class="metric"><span>95% interval</span>
 <strong>{escape(_fmt_interval(validation))}</strong></div>
+<div class="metric"><span>Valid pairs</span>
+<strong>{validation.valid_pairs} / {validation.completed_pairs} completed
+(minimum {validation.minimum_required_pairs}; planned {validation.planned_pairs})</strong></div>
+<div class="metric"><span>Rejected pairs</span>
+<strong>{validation.invalid_pairs}</strong></div>
 </div>
+<p><strong>Selection metric:</strong> {escape(metric_label)}</p>
 <p><strong>Validation policy:</strong> {escape(validation.policy)}</p>
 <p><strong>Minimum practical gain:</strong>
 {validation.min_improvement_percent:.1f}%</p>
-<p><strong>Threshold guaranteed:</strong>
+<p><strong>Statistical test:</strong> {escape(statistical_text)}</p>
+<p><strong>95% lower bound meets minimum:</strong>
 {"yes" if validation.threshold_guaranteed else "no"}</p>
+<p><strong>Validation complete:</strong>
+{"no" if validation.validation_incomplete else "yes"}</p>
 <p><strong>Decision:</strong> {escape(validation.reason)}</p>
 <p><strong>Final recommendation:</strong>
 <code>{escape(self.best_config.describe())}</code></p>
 {search_note}
 {observations_html}
+{rejections_html}
 {failures_html}
 </section>"""
 
@@ -988,6 +1077,8 @@ loss, backward, and optimizer step around the DataLoader.</p>
         return {
             "timing_profile": self.settings.timing_profile,
             "selection_metric": self.settings.selection_metric,
+            "median_throughput": summary.median_throughput,
+            "selection_value": selection_value(summary, self.settings.selection_metric),
             "median_total_elapsed_s": summary.median_total_elapsed_s,
             "median_amortized_throughput": summary.median_amortized_throughput,
             "ci_low_amortized_throughput": summary.ci_low_amortized_throughput,
@@ -1014,6 +1105,11 @@ loss, backward, and optimizer step around the DataLoader.</p>
         rows = [
             ("Timing profile", self.settings.timing_profile),
             ("Selection metric", self.settings.selection_metric),
+            ("Median sustained throughput", f"{details['median_throughput']:,.1f} samples/s"),
+            (
+                f"Median {selection_metric_label(self.settings.selection_metric)}",
+                _fmt_optional_throughput(details["selection_value"]),
+            ),
             ("Median total trial wall", _fmt_ms(details["median_total_elapsed_s"])),
             (
                 "Median amortized throughput",

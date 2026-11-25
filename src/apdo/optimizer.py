@@ -35,7 +35,13 @@ from apdo.loader import (
     LoaderTemplate,
     initial_loader_config,
 )
-from apdo.metrics import MetricsSummary
+from apdo.metrics import (
+    MetricsSummary,
+    is_valid_throughput,
+    selection_interval,
+    selection_metric_label,
+    selection_value,
+)
 from apdo.order import RoundOrder
 from apdo.report import OptimizationResult
 from apdo.resources import available_cpu_count, collect_environment
@@ -51,12 +57,14 @@ MATERIAL_BAND = 0.95
 DEFAULT_MAX_WORKERS = 8
 DEFAULT_SEED = 42
 DEFAULT_ROUNDS = 3
-DEFAULT_VALIDATION_ROUNDS = 5
+DEFAULT_VALIDATION_ROUNDS = 10
 DEFAULT_MIN_IMPROVEMENT = 0.05
 DEFAULT_TRAINING_EPOCHS = 3
 DEFAULT_TRAINING_ROUNDS = 2
 DEFAULT_MAX_TRAINING_CANDIDATES = 3
 FINALIST_WORKERS = 2
+TRADEOFF_IMPROVEMENT = 0.05
+TRADEOFF_REGRESSION = 0.10
 PIN_CANDIDATES = (False, True)
 PREFETCH_CANDIDATES = (2, 4)
 PERSISTENT_CANDIDATES = (False, True)
@@ -68,6 +76,7 @@ class _Selection:
     fastest: ConfigMeasurement
     equivalent: tuple[ConfigMeasurement, ...]
     reason: str
+    excluded: tuple[ConfigMeasurement, ...] = ()
 
 
 def optimize(
@@ -322,7 +331,7 @@ def optimize(
             "safe fallback baseline." + detail
         )
 
-    finalist_workers = _finalist_workers(stage_one_successes)
+    finalist_workers = _finalist_workers(stage_one_successes, selection_metric)
     seen = {item.config for item in measurements}
     stage_two: list[LoaderConfig] = []
     for workers in finalist_workers:
@@ -377,6 +386,13 @@ def optimize(
     _emit(progress, "Selecting a loader search recommendation")
     loader_selection = _select_configuration(measurements, selection_metric)
     selection = loader_selection
+    warnings.extend(
+        _excluded_metric_warnings(
+            loader_selection.excluded,
+            selection_metric,
+            "loader search",
+        )
+    )
     if mode == "training":
         baseline = _measurement_for_config(measurements, initial_config)
         training_candidates = _training_candidates(
@@ -384,6 +400,7 @@ def optimize(
             selection=loader_selection,
             measurements=measurements,
             limit=max_training_candidates,
+            selection_metric=selection_metric,
         )
         training_result = _run_stage(
             source=source,
@@ -420,6 +437,13 @@ def optimize(
                 "measurement, so APDO cannot establish a safe fallback.\n" + detail
             )
         selection = _select_configuration(training_successes, selection_metric)
+        warnings.extend(
+            _excluded_metric_warnings(
+                selection.excluded,
+                selection_metric,
+                "training finalist selection",
+            )
+        )
         if training_result.budget_exhausted:
             warnings.append(
                 "The time budget stopped training finalists before all planned rounds completed."
@@ -436,6 +460,7 @@ def optimize(
     search_improvement = (
         selected_value / baseline_value - 1.0 if baseline_value > 0 else 0.0
     ) * 100.0
+    warnings.extend(_tradeoff_warnings(baseline, selection.selected, selection_metric))
 
     failures = [item for item in measurements if not item.succeeded]
     if failures:
@@ -480,6 +505,7 @@ def optimize(
         selection_metric=selection_metric,
         comparability_policy=comparability_policy,
         fingerprint_fn=sample_fingerprint_fn,
+        planned_pairs=validation_rounds_used,
     )
     orders.extend(validation_orders)
     budget_exhausted = budget_exhausted or validation_budget
@@ -514,6 +540,20 @@ def optimize(
         )
     if validation_result.status == "regression":
         warnings.append("Validation observed a candidate regression.")
+    if validation_result.invalid_pairs:
+        warnings.append(
+            f"{validation_result.invalid_pairs} paired validation observations were rejected "
+            "as invalid; see the report for rejection reasons."
+        )
+    if (
+        validation_result.status == "not_possible"
+        and validation_result.valid_pairs < validation_result.minimum_required_pairs
+    ):
+        warnings.append(
+            f"Independent validation produced {validation_result.valid_pairs} valid paired "
+            f"observations; at least {validation_result.minimum_required_pairs} are required "
+            "for confirmation."
+        )
 
     duration_s = time.perf_counter() - start_time
     _emit(
@@ -564,7 +604,7 @@ def resolve_device(device: str | torch.device) -> torch.device:
             )
     elif resolved.type != "cpu":
         raise ConfigurationError(
-            f"device type {resolved.type!r} is not supported in v0.3.0; "
+            f"device type {resolved.type!r} is not supported in this version; "
             "use 'auto', 'cpu', or 'cuda'"
         )
     return resolved
@@ -655,11 +695,18 @@ def _training_candidates(
     selection: _Selection,
     measurements: Sequence[ConfigMeasurement],
     limit: int,
+    selection_metric: str = "sustained",
 ) -> list[LoaderConfig]:
     ordered = [baseline.config, selection.selected.config, selection.fastest.config]
     ranked = sorted(
-        (item for item in measurements if item.succeeded and item.summary is not None),
-        key=lambda item: _summary(item).median_throughput,
+        (
+            item
+            for item in measurements
+            if item.succeeded
+            and item.summary is not None
+            and _metric_value(_summary(item), selection_metric) > 0.0
+        ),
+        key=lambda item: _metric_value(_summary(item), selection_metric),
         reverse=True,
     )
     ordered.extend(item.config for item in ranked)
@@ -800,11 +847,13 @@ def _run_stage(
         if measurement.succeeded:
             summary = _summary(measurement)
             unit = "samples/s" if measurement.training else "loader samples/s"
+            amortized = summary.median_amortized_throughput
+            amortized_text = f"{amortized:,.1f}" if amortized is not None else "n/a"
             _emit(
                 progress,
                 f"  {measurement.config.describe()}: "
-                f"{summary.median_throughput:,.1f} {unit} across "
-                f"{len(measurement.passes)} rounds",
+                f"{summary.median_throughput:,.1f} sustained / {amortized_text} amortized "
+                f"{unit} across {len(measurement.passes)} rounds",
             )
         else:
             _emit(
@@ -838,6 +887,7 @@ def _run_validation(
     selection_metric: str = "sustained",
     comparability_policy: str = "warn",
     fingerprint_fn: Callable[[Any], Any] | None = None,
+    planned_pairs: int = 0,
 ) -> tuple[ValidationResult, tuple[RoundOrder, ...], bool]:
     if candidate_config == baseline_config:
         result = analyze_validation(
@@ -874,6 +924,8 @@ def _run_validation(
             failures=("Independent validation was skipped because the time budget expired.",),
             policy=validation_policy,
             selection_metric=selection_metric,
+            planned_pairs=planned_pairs,
+            validation_incomplete=True,
         )
         return result, (), True
     legacy_template = template if source is None else None
@@ -936,7 +988,8 @@ def _run_validation(
             )
     if stage.budget_exhausted:
         failure_messages.append(
-            "The time budget stopped validation before all planned rounds completed."
+            "The time budget stopped validation before all planned rounds completed; "
+            "collected observations were retained but confirmation is refused."
         )
 
     observations: list[ValidationObservation] = []
@@ -951,8 +1004,6 @@ def _run_validation(
                     candidate=candidate_rounds[round_index].pass_metrics,
                 )
             )
-    if stage.budget_exhausted:
-        observations = []
 
     comparison = (
         compare_measurements(baseline_measurement, candidate_measurement)
@@ -971,6 +1022,8 @@ def _run_validation(
         selection_metric=selection_metric,
         comparability=comparison,
         comparability_policy=comparability_policy,
+        planned_pairs=planned_pairs,
+        validation_incomplete=stage.budget_exhausted,
     )
     return result, stage.orders, stage.budget_exhausted
 
@@ -1007,20 +1060,26 @@ def _stage_one_configs(
     return configs
 
 
-def _finalist_workers(measurements: Sequence[ConfigMeasurement]) -> list[int]:
+def _finalist_workers(
+    measurements: Sequence[ConfigMeasurement],
+    selection_metric: str = "sustained",
+) -> list[int]:
     best_by_worker: dict[int, ConfigMeasurement] = {}
     for measurement in measurements:
         workers = measurement.config.num_workers
         if workers == 0 or measurement.summary is None:
             continue
+        if _metric_value(_summary(measurement), selection_metric) <= 0.0:
+            continue
         current = best_by_worker.get(workers)
         if current is None or (
-            _summary(measurement).median_throughput > _summary(current).median_throughput
+            _metric_value(_summary(measurement), selection_metric)
+            > _metric_value(_summary(current), selection_metric)
         ):
             best_by_worker[workers] = measurement
     ranked = sorted(
         best_by_worker.values(),
-        key=lambda item: _summary(item).median_throughput,
+        key=lambda item: _metric_value(_summary(item), selection_metric),
         reverse=True,
     )
     return [item.config.num_workers for item in ranked[:FINALIST_WORKERS]]
@@ -1035,9 +1094,17 @@ def _select_configuration(
         raise BenchmarkError("no successful configuration is available for selection")
     if selection_metric not in SELECTION_METRICS:
         raise ConfigurationError(f"selection_metric must be one of {SELECTION_METRICS}")
+    label = selection_metric_label(selection_metric)
+
+    eligible = [
+        item for item in successful if _metric_value(_summary(item), selection_metric) > 0.0
+    ]
+    excluded = tuple(item for item in successful if item not in eligible)
+    if not eligible:
+        raise BenchmarkError(f"no successful configuration reported a positive {label} value")
 
     fastest = max(
-        successful,
+        eligible,
         key=lambda item: _metric_value(_summary(item), selection_metric),
     )
     fastest_summary = _summary(fastest)
@@ -1045,7 +1112,7 @@ def _select_configuration(
     fastest_low, fastest_high = _metric_interval(fastest_summary, selection_metric)
     equivalent = [
         item
-        for item in successful
+        for item in eligible
         if _metric_value(_summary(item), selection_metric) >= fastest_value * MATERIAL_BAND
         and _metric_interval(_summary(item), selection_metric)[0] <= fastest_high
         and fastest_low <= _metric_interval(_summary(item), selection_metric)[1]
@@ -1075,27 +1142,92 @@ def _select_configuration(
         fastest=fastest,
         equivalent=tuple(equivalent),
         reason=reason,
+        excluded=excluded,
     )
 
 
 def _metric_value(summary: MetricsSummary, selection_metric: str) -> float:
-    if selection_metric == "amortized":
-        return summary.median_amortized_throughput or 0.0
-    return summary.median_throughput
+    value = selection_value(summary, selection_metric)
+    if value is None or not math.isfinite(value) or value <= 0.0:
+        return 0.0
+    return value
 
 
 def _metric_interval(
     summary: MetricsSummary,
     selection_metric: str,
 ) -> tuple[float, float]:
-    if selection_metric == "amortized" and summary.ci_low_amortized_throughput is not None:
-        return (
-            summary.ci_low_amortized_throughput,
-            summary.ci_high_amortized_throughput
-            if summary.ci_high_amortized_throughput is not None
-            else summary.ci_low_amortized_throughput,
+    interval = selection_interval(summary, selection_metric)
+    if interval is None:
+        return 0.0, 0.0
+    return interval
+
+
+def _excluded_metric_warnings(
+    excluded: Sequence[ConfigMeasurement],
+    selection_metric: str,
+    context: str,
+) -> list[str]:
+    if not excluded:
+        return []
+    label = selection_metric_label(selection_metric)
+    configurations = ", ".join(item.config.describe() for item in excluded)
+    return [
+        f"{len(excluded)} configuration(s) were excluded from {context} because they "
+        f"did not report a positive finite {label}: {configurations}."
+    ]
+
+
+def _tradeoff_warnings(
+    baseline: ConfigMeasurement,
+    candidate: ConfigMeasurement,
+    selection_metric: str,
+) -> list[str]:
+    baseline_summary = baseline.summary
+    candidate_summary = candidate.summary
+    if baseline_summary is None or candidate_summary is None:
+        return []
+    baseline_sustained = baseline_summary.median_throughput
+    baseline_amortized = baseline_summary.median_amortized_throughput
+    candidate_sustained = candidate_summary.median_throughput
+    candidate_amortized = candidate_summary.median_amortized_throughput
+    if (
+        not is_valid_throughput(baseline_sustained)
+        or not is_valid_throughput(baseline_amortized)
+        or not is_valid_throughput(candidate_sustained)
+        or not is_valid_throughput(candidate_amortized)
+    ):
+        return []
+    assert baseline_amortized is not None
+    assert candidate_amortized is not None
+    sustained_change = candidate_sustained / baseline_sustained - 1.0
+    amortized_change = candidate_amortized / baseline_amortized - 1.0
+    warnings: list[str] = []
+    if (
+        selection_metric == "sustained"
+        and sustained_change >= TRADEOFF_IMPROVEMENT
+        and amortized_change <= -TRADEOFF_REGRESSION
+    ):
+        warnings.append(
+            f"The search-selected candidate improved sustained throughput by "
+            f"{sustained_change * 100.0:+.1f}% but reduced amortized throughput by "
+            f"{amortized_change * 100.0:+.1f}% versus the initial configuration. "
+            "Sustained and total-trial behavior diverge materially; consider "
+            "selection_metric='amortized' when startup and cleanup costs matter."
         )
-    return summary.ci_low_throughput, summary.ci_high_throughput
+    elif (
+        selection_metric == "amortized"
+        and amortized_change >= TRADEOFF_IMPROVEMENT
+        and sustained_change <= -TRADEOFF_REGRESSION
+    ):
+        warnings.append(
+            f"The search-selected candidate improved amortized throughput by "
+            f"{amortized_change * 100.0:+.1f}% but reduced sustained throughput by "
+            f"{sustained_change * 100.0:+.1f}% versus the initial configuration. "
+            "Sustained and total-trial behavior diverge materially; inspect the "
+            "lifecycle timing before accepting the candidate."
+        )
+    return warnings
 
 
 def _final_reason(
