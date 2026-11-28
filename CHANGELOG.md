@@ -2,6 +2,43 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.5.0] - 2026-11-28
+
+### Added
+
+- Adaptive search strategy with deterministic screening, reduced exploratory rounds, one-worker refinement, and a recorded search trace. The default remains grid search.
+- Cooperative time-budget categories for search, training finalists, validation, cleanup, and overhead, with validation reservation, skipped-trial accounting, and budget-aware stage boundaries.
+- Profitability estimates for loader-only and end-to-end training scopes, including conservative and optimistic net savings, break-even epochs, and `result.estimate_profitability(...)`.
+- Opt-in local JSON recommendation cache with `off`, `hint`, and `revalidate` policies, deterministic identities, atomic writes, bounded pruning, corruption tolerance, and `apdo cache list`/`apdo cache clear`.
+- `search_strategy`, `planned_epochs`, `planned_sessions`, `cache_policy`, `cache_key`, and `cache_directory` options in the Python API and benchmark CLI.
+- Search trace, budget, profitability, and cache sections in text, JSON schema 5, and self-contained HTML reports.
+- Resource diagnostics for effective CPU count, CPU affinity, cgroup memory and CPU limits, and the multiprocessing start method, with worker search capped by effective CPU availability.
+- Benchmark protocol version 5.0 and JSON schema version 5.
+- Tests for budget accounting and reservation, cache safety and identity checks, profitability states, adaptive search traces, CLI cache commands, and v0.5 report sections.
+
+### Changed
+
+- `OptimizationResult` now exposes `budget`, `search_trace`, `profitability`, and `cache` fields.
+- Budget checks occur at measured round boundaries; completed observations are retained, while zero-pass trials are reported as budget-skipped.
+- Adaptive search screens worker counts with fewer rounds and refines a single worker finalist before independent validation.
+- Cache hits may bias search but never replace fresh validation evidence.
+- README, examples, and report method text now describe v0.5.0 behavior.
+
+### Fixed
+
+- A baseline recommendation now reports zero saved time per epoch instead of inheriting a different candidate measurement.
+- Budget category timing is recorded for search, training finalists, and validation.
+- CLI cache clearing requires explicit `--yes` confirmation.
+
+### Known limitations
+
+- Adaptive screening reduces trials but can eliminate a candidate that would have benefited from more rounds.
+- The time budget is cooperative, not a hard process timeout.
+- The cache is local and opt-in; cached evidence is historical and must still pass current validation.
+- Profitability estimates depend on the supplied future horizon and observed throughput.
+- The memory limit remains sampled and advisory.
+- macOS is not covered by CI in this release.
+
 ## [0.4.1] - 2026-11-25
 
 ### Added

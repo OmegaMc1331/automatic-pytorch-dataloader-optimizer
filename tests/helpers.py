@@ -99,6 +99,10 @@ def make_environment() -> EnvironmentInfo:
         total_memory_bytes=16 * 1024**3,
         available_memory_bytes=8 * 1024**3,
         torch_num_threads=8,
+        effective_cpu_count=8,
+        multiprocessing_start_method="spawn",
+        cgroup_memory_limit_bytes=None,
+        cgroup_cpu_limit=None,
     )
 
 
@@ -125,7 +129,7 @@ def make_settings(
         time_budget_s=None,
         initial_config=initial_config or LoaderConfig(),
         input_kind="dataset",
-        protocol_version="4.1",
+        protocol_version="5.0",
         expected_batches=8,
     )
 

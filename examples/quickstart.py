@@ -23,9 +23,13 @@ def main() -> None:
         validation_rounds=10,
         max_workers=4,
         seed=42,
+        search_strategy="adaptive",
+        planned_epochs=50,
     )
     print(result.summary())
     print(f"Validation status: {result.validation.status}")
+    print(result.search_trace.summary())
+    print(result.profitability.summary())
 
     optimized_loader = result.build_dataloader()
     features_batch, _ = next(iter(optimized_loader))

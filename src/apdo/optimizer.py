@@ -3,8 +3,10 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from contextlib import nullcontext
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -17,11 +19,19 @@ from apdo.benchmark import (
     benchmark_rounds,
     benchmark_source,
 )
+from apdo.budget import BudgetController, estimate_validation_budget
+from apdo.cache import (
+    CACHE_POLICIES,
+    ConfigCache,
+    build_cache_entry,
+    cache_identity,
+)
 from apdo.comparability import compare_measurements, validate_comparability_policy
 from apdo.config import (
     BENCHMARK_MODES,
     BENCHMARK_PROTOCOL_VERSION,
     MAX_BENCHMARK_EPOCHS,
+    SEARCH_STRATEGIES,
     SELECTION_METRICS,
     TIMING_PROFILES,
     VALIDATION_POLICIES,
@@ -43,8 +53,10 @@ from apdo.metrics import (
     selection_value,
 )
 from apdo.order import RoundOrder
+from apdo.profitability import estimate_profitability
 from apdo.report import OptimizationResult
 from apdo.resources import available_cpu_count, collect_environment
+from apdo.search import adaptive_worker_counts, build_search_trace
 from apdo.training import TrainingStepFactory
 from apdo.validation import (
     ValidationObservation,
@@ -108,6 +120,12 @@ def optimize(
     validation_rounds: int = DEFAULT_VALIDATION_ROUNDS,
     min_improvement: float = DEFAULT_MIN_IMPROVEMENT,
     time_budget_s: float | None = None,
+    search_strategy: str = "grid",
+    planned_epochs: int | None = None,
+    planned_sessions: int = 1,
+    cache_policy: str = "off",
+    cache_key: str | None = None,
+    cache_directory: str | Path | None = None,
     sample_count_fn: Callable[[Any], int] | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> OptimizationResult:
@@ -129,6 +147,22 @@ def optimize(
         raise ConfigurationError("validation_rounds must be at least 2 when validation is enabled")
     min_improvement = _fraction(min_improvement, "min_improvement")
     time_budget = _positive_float(time_budget_s, "time_budget_s")
+    if search_strategy not in SEARCH_STRATEGIES:
+        raise ConfigurationError(f"search_strategy must be one of {SEARCH_STRATEGIES}")
+    if cache_policy not in CACHE_POLICIES:
+        raise ConfigurationError(f"cache_policy must be one of {CACHE_POLICIES}")
+    if cache_key is not None:
+        if not isinstance(cache_key, str) or not cache_key.strip():
+            raise ConfigurationError("cache_key must be a non-empty string or None")
+        cache_key = cache_key.strip()
+    if cache_directory is not None:
+        if not isinstance(cache_directory, (str, Path)):
+            raise ConfigurationError("cache_directory must be a path-like value or None")
+        cache_directory = Path(cache_directory)
+    planned_epochs = (
+        None if planned_epochs is None else _positive_int(planned_epochs, "planned_epochs")
+    )
+    planned_sessions = _positive_int(planned_sessions, "planned_sessions")
     if max_batches is not None:
         max_batches = _positive_int(max_batches, "max_batches")
         if max_batches < 2:
@@ -208,6 +242,7 @@ def optimize(
     started_at = datetime.now(timezone.utc)
     start_time = time.perf_counter()
     deadline = start_time + time_budget if time_budget is not None else None
+    budget = BudgetController(time_budget)
     _emit(progress, "Collecting environment information")
     environment = collect_environment()
     cpu_count = available_cpu_count()
@@ -245,7 +280,27 @@ def optimize(
         selection_metric=selection_metric,
         comparability_policy=comparability_policy,
         sample_fingerprint=sample_fingerprint_fn is not None,
+        search_strategy=search_strategy,
+        planned_epochs=planned_epochs,
+        planned_sessions=planned_sessions,
+        cache_policy=cache_policy,
+        cache_key=cache_key,
     )
+
+    cache = ConfigCache(cache_directory) if cache_policy != "off" else None
+    cache_identity_value = _build_cache_identity(
+        source=source,
+        environment=environment,
+        settings=settings,
+        plan=plan,
+        resolved_max_workers=resolved_max_workers,
+    )
+    cache_lookup = (
+        cache.lookup(cache_key or cache_identity_value, cache_identity_value)
+        if cache is not None
+        else None
+    )
+    cache_hit = cache_lookup is not None and cache_lookup.hit
 
     warnings = _initial_warnings(
         plan=plan,
@@ -284,9 +339,23 @@ def optimize(
     max_ram_bytes = int(max_ram_value * 1_000_000_000) if max_ram_value is not None else None
     pin_options = _pin_options(resolved_device)
     worker_counts = _build_worker_counts(resolved_max_workers, cpu_count)
+    if search_strategy == "adaptive":
+        worker_counts = list(adaptive_worker_counts(worker_counts))
     stage_one = _stage_one_configs(worker_counts, pin_options, initial_config)
+    cached_config = cache_lookup.entry.recommended_config if cache_hit and cache_lookup else None
+    if cached_config is not None and cached_config not in stage_one:
+        stage_one = [initial_config, cached_config]
     stage_total = 3 if mode == "training" else 2
     search_epochs = 1 if mode == "training" else resolved_epochs
+    screening_rounds = (
+        min(2, effective_rounds) if search_strategy == "adaptive" else effective_rounds
+    )
+    if search_strategy == "adaptive":
+        warnings.append(
+            "Adaptive search screens worker counts with fewer rounds and refines one "
+            "worker finalist; the selected candidate still requires fresh independent "
+            "validation."
+        )
     stage_one_result = _run_stage(
         source=source,
         configs=stage_one,
@@ -295,7 +364,7 @@ def optimize(
         device=resolved_device,
         plan=plan,
         warmup_rounds=warmup_runs,
-        rounds=effective_rounds,
+        rounds=screening_rounds,
         max_ram_bytes=max_ram_bytes,
         seed=seed,
         deadline=deadline,
@@ -305,9 +374,13 @@ def optimize(
         timing_profile=timing_profile,
         comparability_policy=comparability_policy,
         fingerprint_fn=sample_fingerprint_fn,
+        budget=budget,
+        budget_category="search",
     )
     measurements = list(stage_one_result.measurements)
     orders = list(stage_one_result.orders)
+    stage_one_name = "screening" if search_strategy == "adaptive" else "worker_scan"
+    search_stages: list[tuple[str, StageResult]] = [(stage_one_name, stage_one_result)]
     budget_exhausted = stage_one_result.budget_exhausted
     stage_one_successes = [item for item in measurements if item.succeeded]
     if not stage_one_successes:
@@ -331,7 +404,26 @@ def optimize(
             "safe fallback baseline." + detail
         )
 
-    finalist_workers = _finalist_workers(stage_one_successes, selection_metric)
+    validation_budget_s = estimate_validation_budget(
+        budget.estimated_next_trial_s
+        or (baseline.summary.median_total_elapsed_s if baseline.summary is not None else None),
+        validation_rounds=validation_rounds_used,
+        warmup_runs=warmup_runs,
+    )
+    validation_reserved = True
+    if validation and budget.budget_s is not None:
+        validation_reserved = budget.reserve_validation(validation_budget_s)
+        if not validation_reserved:
+            warnings.append(
+                "The time budget is too small to reserve a complete independent validation; "
+                "validation will be skipped and the initial configuration retained."
+            )
+
+    finalist_workers = _finalist_workers(
+        stage_one_successes,
+        selection_metric,
+        limit=1 if search_strategy == "adaptive" else FINALIST_WORKERS,
+    )
     seen = {item.config for item in measurements}
     stage_two: list[LoaderConfig] = []
     for workers in finalist_workers:
@@ -348,7 +440,13 @@ def optimize(
                         seen.add(config)
                         stage_two.append(config)
 
-    if time_budget is not None and time.perf_counter() >= deadline:
+    if cache_hit:
+        _emit(progress, "Stage 2: skipped because a matching cache hint was used")
+        warnings.append(
+            "A matching local cache hint supplied the search candidate; the flag sweep "
+            "was skipped and the candidate still requires fresh independent validation."
+        )
+    elif _budget_expired(budget, deadline):
         budget_exhausted = True
         _emit(progress, "Stage 2: skipped because the time budget was exhausted")
         warnings.append(
@@ -374,9 +472,12 @@ def optimize(
             timing_profile=timing_profile,
             comparability_policy=comparability_policy,
             fingerprint_fn=sample_fingerprint_fn,
+            budget=budget,
+            budget_category="search",
         )
         measurements.extend(stage_two_result.measurements)
         orders.extend(stage_two_result.orders)
+        search_stages.append(("flag_sweep", stage_two_result))
         budget_exhausted = budget_exhausted or stage_two_result.budget_exhausted
         if stage_two_result.budget_exhausted:
             warnings.append("The time budget stopped the flag sweep before all rounds completed.")
@@ -421,9 +522,12 @@ def optimize(
             timing_profile=timing_profile,
             comparability_policy=comparability_policy,
             fingerprint_fn=sample_fingerprint_fn,
+            budget=budget,
+            budget_category="training_finalist",
         )
         measurements.extend(training_result.measurements)
         orders.extend(training_result.orders)
+        search_stages.append(("training_finalists", training_result))
         budget_exhausted = budget_exhausted or training_result.budget_exhausted
         training_successes = [item for item in training_result.measurements if item.succeeded]
         baseline = next(
@@ -506,6 +610,8 @@ def optimize(
         comparability_policy=comparability_policy,
         fingerprint_fn=sample_fingerprint_fn,
         planned_pairs=validation_rounds_used,
+        budget=budget,
+        validation_reserved=validation_reserved,
     )
     orders.extend(validation_orders)
     budget_exhausted = budget_exhausted or validation_budget
@@ -561,7 +667,52 @@ def optimize(
         f"Validation status: {validation_result.status}; recommended {final_config.describe()}",
     )
     _emit(progress, f"Optimization completed in {duration_s:.2f} s")
-    return OptimizationResult(
+
+    training = mode == "training"
+    final_measurement = next(
+        (
+            item
+            for item in measurements
+            if item.succeeded
+            and item.config == final_config
+            and item.training == training
+            and item.summary is not None
+        ),
+        None,
+    )
+    if final_measurement is None:
+        final_measurement = baseline
+    final_summary = _summary(final_measurement)
+    profitability = estimate_profitability(
+        baseline_summary=baseline_summary if baseline is not None else None,
+        optimized_summary=final_summary,
+        optimization_cost_s=duration_s,
+        epochs=resolved_epochs,
+        validation_status=validation_result.status,
+        confirmed=validation_result.confirmed,
+        candidate_is_baseline=final_config == initial_config,
+        planned_epochs=planned_epochs,
+        planned_sessions=planned_sessions,
+        scope="end_to_end_training" if training else "loader",
+    )
+    search_trace = build_search_trace(
+        strategy=search_strategy,
+        stages=search_stages,
+        planned_rounds=effective_rounds,
+        selected_config=selection.selected.config,
+        fastest_config=selection.fastest.config,
+        cache_hit=cache_hit,
+    )
+    cache_lookup_key = cache_key or cache_identity_value
+    cache_payload = {
+        "policy": cache_policy,
+        "key": cache_key,
+        "derived_key": cache_key is None,
+        "hit": cache_hit,
+        "reason": cache_lookup.reason if cache_lookup is not None else "cache disabled",
+        "identity": cache_identity_value,
+    }
+    result = OptimizationResult(
         best_config=final_config,
         fastest_config=selection.fastest.config,
         search_selected_config=selection.selected.config,
@@ -582,7 +733,47 @@ def optimize(
         search_improvement_percent=search_improvement,
         search_selection_reason=selection.reason,
         budget_exhausted=budget_exhausted,
+        budget=budget.to_dict(),
+        search_trace=search_trace,
+        profitability=profitability,
+        cache=cache_payload,
     )
+    if cache is not None and validation_result.confirmed:
+        entry = build_cache_entry(
+            key=cache_lookup_key,
+            identity=cache_identity_value,
+            config=selection.selected.config,
+            recommended_config=final_config,
+            validation_status=validation_result.status,
+            improvement_percent=validation_result.improvement_percent,
+            search_improvement_percent=search_improvement,
+            selection_metric=selection_metric,
+            benchmark_mode=mode,
+            environment=environment.to_dict(),
+            source={
+                "input_kind": source.input_kind,
+                "dataset_size": source.dataset_size,
+                "batch_size": source.batch_size,
+                "expected_batches": source.expected_batches,
+                "reproducibility_status": source.isolation.status,
+            },
+            evidence={
+                "valid_pairs": validation_result.valid_pairs,
+                "planned_pairs": validation_result.planned_pairs,
+                "statistical_p_value": validation_result.statistical_p_value,
+                "ci_low_percent": validation_result.ci_low_percent,
+                "ci_high_percent": validation_result.ci_high_percent,
+                "search_strategy": search_strategy,
+            },
+        )
+        try:
+            cache.store(entry)
+            cache_payload["stored"] = True
+        except OSError as exc:
+            cache_payload["stored"] = False
+            cache_payload["store_error"] = f"{type(exc).__name__}: {exc}"
+            result = replace(result, cache=dict(cache_payload))
+    return result
 
 
 def resolve_device(device: str | torch.device) -> torch.device:
@@ -819,30 +1010,36 @@ def _run_stage(
     timing_profile: str = "standard",
     comparability_policy: str = "warn",
     fingerprint_fn: Callable[[Any], Any] | None = None,
+    budget: BudgetController | None = None,
+    budget_category: str = "search",
 ) -> StageResult:
     _emit(
         progress,
         f"Stage {stage_number}/{stage_total}: {phase} with {len(configs)} configurations, "
         f"{rounds} measured rounds, {epochs} epoch(s)",
     )
-    result = benchmark_source(
-        source,
-        configs,
-        phase=phase,
-        device=device,
-        plan=plan,
-        warmup_rounds=warmup_rounds,
-        rounds=rounds,
-        max_ram_bytes=max_ram_bytes,
-        seed=seed,
-        deadline=deadline,
-        progress=progress,
-        epochs=epochs,
-        training_step_factory=training_step_factory,
-        timing_profile=timing_profile,
-        fingerprint_fn=fingerprint_fn,
-        collect_comparability=comparability_policy != "off",
-    )
+    phase_context = budget.phase(budget_category) if budget is not None else nullcontext()
+    with phase_context:
+        result = benchmark_source(
+            source,
+            configs,
+            phase=phase,
+            device=device,
+            plan=plan,
+            warmup_rounds=warmup_rounds,
+            rounds=rounds,
+            max_ram_bytes=max_ram_bytes,
+            seed=seed,
+            deadline=deadline,
+            progress=progress,
+            epochs=epochs,
+            training_step_factory=training_step_factory,
+            timing_profile=timing_profile,
+            fingerprint_fn=fingerprint_fn,
+            collect_comparability=comparability_policy != "off",
+            budget=budget,
+            budget_category=budget_category,
+        )
     for measurement in result.measurements:
         if measurement.succeeded:
             summary = _summary(measurement)
@@ -888,6 +1085,8 @@ def _run_validation(
     comparability_policy: str = "warn",
     fingerprint_fn: Callable[[Any], Any] | None = None,
     planned_pairs: int = 0,
+    budget: BudgetController | None = None,
+    validation_reserved: bool = True,
 ) -> tuple[ValidationResult, tuple[RoundOrder, ...], bool]:
     if candidate_config == baseline_config:
         result = analyze_validation(
@@ -913,7 +1112,25 @@ def _run_validation(
             selection_metric=selection_metric,
         )
         return result, (), False
-    if deadline is not None and time.perf_counter() >= deadline:
+    if not validation_reserved:
+        result = analyze_validation(
+            baseline_config,
+            candidate_config,
+            (),
+            enabled=True,
+            min_improvement=min_improvement,
+            seed=seed,
+            failures=(
+                "Independent validation was skipped because the time budget could not "
+                "reserve the planned paired rounds.",
+            ),
+            policy=validation_policy,
+            selection_metric=selection_metric,
+            planned_pairs=planned_pairs,
+            validation_incomplete=True,
+        )
+        return result, (), True
+    if _budget_expired(budget, deadline):
         result = analyze_validation(
             baseline_config,
             candidate_config,
@@ -939,43 +1156,49 @@ def _run_validation(
         f"Independent validation: alternating {baseline_config.describe()} and "
         f"{candidate_config.describe()} for {validation_rounds} rounds",
     )
-    if training_step_factory is None and legacy_template is not None:
-        stage = benchmark_rounds(
-            legacy_template,
-            (baseline_config, candidate_config),
-            phase="validation",
-            device=device,
-            plan=plan,
-            warmup_rounds=warmup_rounds,
-            rounds=validation_rounds,
-            max_ram_bytes=max_ram_bytes,
-            seed=seed,
-            deadline=deadline,
-            progress=progress,
-            epochs=epochs,
-            timing_profile=timing_profile,
-            fingerprint_fn=fingerprint_fn,
-            collect_comparability=comparability_policy != "off",
-        )
-    else:
-        stage = benchmark_source(
-            source,
-            (baseline_config, candidate_config),
-            phase="validation",
-            device=device,
-            plan=plan,
-            warmup_rounds=warmup_rounds,
-            rounds=validation_rounds,
-            max_ram_bytes=max_ram_bytes,
-            seed=seed,
-            deadline=deadline,
-            progress=progress,
-            epochs=epochs,
-            training_step_factory=training_step_factory,
-            timing_profile=timing_profile,
-            fingerprint_fn=fingerprint_fn,
-            collect_comparability=comparability_policy != "off",
-        )
+    phase_context = budget.phase("validation") if budget is not None else nullcontext()
+    with phase_context:
+        if training_step_factory is None and legacy_template is not None:
+            stage = benchmark_rounds(
+                legacy_template,
+                (baseline_config, candidate_config),
+                phase="validation",
+                device=device,
+                plan=plan,
+                warmup_rounds=warmup_rounds,
+                rounds=validation_rounds,
+                max_ram_bytes=max_ram_bytes,
+                seed=seed,
+                deadline=deadline,
+                progress=progress,
+                epochs=epochs,
+                timing_profile=timing_profile,
+                fingerprint_fn=fingerprint_fn,
+                collect_comparability=comparability_policy != "off",
+                budget=budget,
+                budget_category="validation",
+            )
+        else:
+            stage = benchmark_source(
+                source,
+                (baseline_config, candidate_config),
+                phase="validation",
+                device=device,
+                plan=plan,
+                warmup_rounds=warmup_rounds,
+                rounds=validation_rounds,
+                max_ram_bytes=max_ram_bytes,
+                seed=seed,
+                deadline=deadline,
+                progress=progress,
+                epochs=epochs,
+                training_step_factory=training_step_factory,
+                timing_profile=timing_profile,
+                fingerprint_fn=fingerprint_fn,
+                collect_comparability=comparability_policy != "off",
+                budget=budget,
+                budget_category="validation",
+            )
     by_config = {item.config: item for item in stage.measurements}
     baseline_measurement = by_config[baseline_config]
     candidate_measurement = by_config[candidate_config]
@@ -1063,6 +1286,8 @@ def _stage_one_configs(
 def _finalist_workers(
     measurements: Sequence[ConfigMeasurement],
     selection_metric: str = "sustained",
+    *,
+    limit: int = FINALIST_WORKERS,
 ) -> list[int]:
     best_by_worker: dict[int, ConfigMeasurement] = {}
     for measurement in measurements:
@@ -1082,7 +1307,7 @@ def _finalist_workers(
         key=lambda item: _metric_value(_summary(item), selection_metric),
         reverse=True,
     )
-    return [item.config.num_workers for item in ranked[:FINALIST_WORKERS]]
+    return [item.config.num_workers for item in ranked[:limit]]
 
 
 def _select_configuration(
@@ -1245,6 +1470,97 @@ def _final_reason(
         f"The search favored {selection.selected.config.describe()} over "
         f"{initial_config.describe()}, but independent validation did not confirm the "
         f"gain. {validation.reason} The initial configuration is recommended."
+    )
+
+
+def _budget_expired(budget: BudgetController | None, deadline: float | None) -> bool:
+    if budget is not None and budget.expired():
+        return True
+    return deadline is not None and time.perf_counter() >= deadline
+
+
+def _build_cache_identity(
+    *,
+    source: LoaderSource,
+    environment: Any,
+    settings: BenchmarkSettings,
+    plan: BatchPlan,
+    resolved_max_workers: int,
+) -> str:
+    template = source.template
+    dataset = template.dataset if template is not None else None
+    source_payload = {
+        "input_kind": source.input_kind,
+        "dataset_size": source.dataset_size,
+        "expected_batches": source.expected_batches,
+        "batch_size": source.batch_size,
+        "unbatched": source.unbatched,
+        "dataset_class": (
+            f"{type(dataset).__module__}.{type(dataset).__qualname__}"
+            if dataset is not None
+            else "factory"
+        ),
+        "sampler_class": (
+            f"{type(template.sampler).__module__}.{type(template.sampler).__qualname__}"
+            if template is not None
+            else None
+        ),
+        "batch_sampler_class": (
+            f"{type(template.batch_sampler).__module__}.{type(template.batch_sampler).__qualname__}"
+            if template is not None and template.batch_sampler is not None
+            else None
+        ),
+        "drop_last": template.drop_last if template is not None else None,
+        "timeout": template.timeout if template is not None else None,
+        "reproducibility": source.isolation.status,
+    }
+    environment_payload = {
+        "python_version": environment.python_version,
+        "torch_version": environment.torch_version,
+        "cuda_available": environment.cuda_available,
+        "cuda_version": environment.cuda_version,
+        "cuda_devices": [
+            {
+                "name": device.name,
+                "total_memory_bytes": device.total_memory_bytes,
+                "capability": list(device.capability),
+            }
+            for device in environment.cuda_devices
+        ],
+        "cpu_count": environment.cpu_count,
+        "cpu_affinity_count": environment.cpu_affinity_count,
+        "effective_cpu_count": environment.effective_cpu_count,
+        "multiprocessing_start_method": environment.multiprocessing_start_method,
+        "total_memory_bytes": environment.total_memory_bytes,
+        "cgroup_memory_limit_bytes": environment.cgroup_memory_limit_bytes,
+        "cgroup_cpu_limit": environment.cgroup_cpu_limit,
+    }
+    settings_payload = {
+        "protocol_version": settings.protocol_version,
+        "benchmark_mode": settings.benchmark_mode,
+        "epochs": settings.epochs,
+        "rounds": settings.rounds,
+        "warmup_runs": settings.warmup_runs,
+        "max_batches": settings.max_batches,
+        "expected_batches": plan.batches,
+        "max_workers": resolved_max_workers,
+        "device": settings.device,
+        "seed": settings.seed,
+        "validation_rounds": settings.validation_rounds,
+        "min_improvement": settings.min_improvement,
+        "validation_policy": settings.validation_policy,
+        "selection_metric": settings.selection_metric,
+        "timing_profile": settings.timing_profile,
+        "comparability_policy": settings.comparability_policy,
+        "sample_fingerprint": settings.sample_fingerprint,
+        "search_strategy": settings.search_strategy,
+    }
+    return cache_identity(
+        {
+            "source": source_payload,
+            "environment": environment_payload,
+            "settings": settings_payload,
+        }
     )
 
 

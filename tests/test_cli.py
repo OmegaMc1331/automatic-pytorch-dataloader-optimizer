@@ -52,13 +52,19 @@ def test_benchmark_help() -> None:
     assert "--selection-metric" in completed.stdout
     assert "--comparability-policy" in completed.stdout
     assert "--sample-fingerprint" in completed.stdout
+    assert "--search-strategy" in completed.stdout
+    assert "--planned-epochs" in completed.stdout
+    assert "--planned-sessions" in completed.stdout
+    assert "--cache-policy" in completed.stdout
+    assert "--cache-key" in completed.stdout
+    assert "--cache-dir" in completed.stdout
 
 
 def test_version() -> None:
     completed = run_cli("--version")
 
     assert completed.returncode == 0
-    assert "apdo 0.4.1" in completed.stdout
+    assert "apdo 0.5.0" in completed.stdout
 
 
 def test_no_command_prints_help() -> None:
@@ -263,3 +269,18 @@ def test_stability_end_to_end(tmp_path: Path) -> None:
     assert payload["summary"]["runs_total"] == 2
     assert payload["summary"]["runs_succeeded"] >= 1
     assert html_path.read_text(encoding="utf-8").startswith("<!DOCTYPE html>")
+
+
+def test_cache_commands_are_safe(tmp_path: Path) -> None:
+    directory = tmp_path / "cache"
+    listed = run_cli("cache", "list", "--directory", str(directory))
+    assert listed.returncode == 0
+    assert "No cached recommendations" in listed.stdout
+
+    refused = run_cli("cache", "clear", "--directory", str(directory))
+    assert refused.returncode == 2
+    assert "--yes" in refused.stderr
+
+    cleared = run_cli("cache", "clear", "--directory", str(directory), "--yes")
+    assert cleared.returncode == 0
+    assert "Removed 0 cached recommendation" in cleared.stdout

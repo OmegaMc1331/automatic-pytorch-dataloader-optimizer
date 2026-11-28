@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import html
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -19,22 +19,45 @@ from apdo.metrics import (
     selection_value,
 )
 from apdo.order import RoundOrder
+from apdo.profitability import (
+    ProfitabilityEstimate,
+)
+from apdo.profitability import (
+    estimate_profitability as _estimate_profitability,
+)
 from apdo.resources import EnvironmentInfo
+from apdo.search import SearchTrace
 from apdo.validation import MIN_CONFIRMATION_PAIRS, STATISTICAL_ALPHA, ValidationResult
 
 METHOD = {
     "protocol": (
-        "Benchmark protocol 4.1. Search configurations run in loaded, seeded, balanced "
+        "Benchmark protocol 5.0. Search configurations run in loaded, seeded, balanced "
         "rounds. Loader trials reuse one DataLoader across the configured epochs; each "
         "trial is wrapped in global RNG state isolation. Training mode adds an explicit "
         "end-to-end finalist stage. Iterator initialization, first-batch acquisition, "
         "worker shutdown, loader cleanup, and total trial wall are recorded separately."
     ),
     "search": (
-        "Two-stage loader grid search followed, in training mode, by a progressive "
-        "end-to-end stage. Training finalists contain the initial configuration, the "
-        "loader-selected candidate, the loader-fastest candidate, and the fastest "
-        "remaining configurations up to the configured limit."
+        "Grid search is the default. Adaptive search reduces exploratory worker counts "
+        "and records deterministic screening and refinement stages before the same "
+        "independent validation gate. Training finalists contain the initial "
+        "configuration, the loader-selected candidate, the loader-fastest candidate, and "
+        "the fastest remaining configurations up to the configured limit."
+    ),
+    "budget": (
+        "A cooperative time budget is checked at measured round boundaries. Reserved "
+        "validation capacity protects the final confirmation stage; an exhausted budget "
+        "retains the initial configuration instead of confirming partial evidence."
+    ),
+    "cache": (
+        "The local recommendation cache is opt-in and JSON-only. A cache hit can only "
+        "bias search toward a previously validated configuration; current validation "
+        "evidence is always measured fresh."
+    ),
+    "profitability": (
+        "Profitability estimates use the validated or observed throughput gain, the "
+        "measured optimization lifecycle, and a user-supplied future epoch and session "
+        "horizon. They are projections, not guarantees."
     ),
     "selection_metric": (
         "The configured selection metric is sustained throughput by default or amortized "
@@ -94,6 +117,15 @@ LIMITATIONS = (
     "or formal proof of future performance.",
     "Validation requires at least eight valid paired rounds for confirmation. Shorter "
     "experiments are mechanism checks; they cannot confirm a candidate.",
+    "Adaptive screening reduces trials but does not remove measurement noise. A candidate "
+    "that is eliminated early might have performed better under more rounds.",
+    "The time budget is cooperative. Trials already running are allowed to finish when "
+    "safe, and partial evidence is never treated as confirmation.",
+    "Cached recommendations are historical evidence only. Cache hits must still pass "
+    "fresh validation for the current workload and environment.",
+    "Profitability estimates depend on the supplied future horizon and on observed "
+    "throughput; they do not model workload drift, changing hardware, or non-linear "
+    "training costs.",
     "High recommendation agreement across independent stability runs does not by itself "
     "demonstrate that the workload is stable. Runs that fall back to the initial "
     "configuration are reported separately.",
@@ -133,6 +165,10 @@ class OptimizationResult:
     search_improvement_percent: float | None = None
     search_selection_reason: str | None = None
     budget_exhausted: bool = False
+    budget: dict[str, Any] = field(default_factory=dict)
+    search_trace: SearchTrace | None = None
+    profitability: ProfitabilityEstimate | None = None
+    cache: dict[str, Any] = field(default_factory=dict)
     version: str = __version__
 
     @property
@@ -155,6 +191,31 @@ class OptimizationResult:
         if self.loader_template is None:
             raise ValueError("this result does not contain a reconstructable loader template")
         return self.loader_template.build(self.best_config)
+
+    def estimate_profitability(
+        self,
+        planned_epochs: int = 50,
+        planned_sessions: int = 1,
+    ) -> ProfitabilityEstimate:
+        training = self.settings.benchmark_mode == "training"
+        baseline = self._search_measurement_for(
+            self.settings.initial_config,
+            required=False,
+            training=training,
+        )
+        optimized = self._measurement_for(self.best_config)
+        return _estimate_profitability(
+            baseline_summary=baseline.summary if baseline is not None else None,
+            optimized_summary=optimized.summary,
+            optimization_cost_s=self.duration_s,
+            epochs=self.settings.epochs,
+            validation_status=self.validation.status,
+            confirmed=self.validation.confirmed,
+            candidate_is_baseline=self.best_config == self.settings.initial_config,
+            planned_epochs=planned_epochs,
+            planned_sessions=planned_sessions,
+            scope="end_to_end_training" if training else "loader",
+        )
 
     def summary(self) -> str:
         measurement = self._measurement_for(self.best_config)
@@ -207,25 +268,52 @@ class OptimizationResult:
             f"{validation.minimum_required_pairs}; planned {validation.planned_pairs}",
             f"  statistical test: {validation.statistical_method}; {statistical_text}",
             f"  decision: {validation.reason}",
-            "",
-            "Measured performance",
-            f"  median throughput: {summary.median_throughput:,.1f} {throughput_label}",
-            f"  throughput range: {summary.min_throughput:,.1f} - "
-            f"{summary.max_throughput:,.1f} {throughput_label}",
-            f"  median batch latency: {_fmt_ms(summary.median_latency_s)} "
-            f"(p95 {_fmt_ms(summary.p95_latency_s)})",
-            f"  startup to first batch: {_fmt_ms(summary.median_startup_s)} "
-            f"(cold start {cold_start})",
-            f"  amortized trial throughput: "
-            f"{_fmt_optional_throughput(summary.median_amortized_throughput)}",
-            f"  median total trial wall: {_fmt_ms(summary.median_total_elapsed_s)}",
-            f"  lifecycle: iterator {_fmt_ms(summary.median_iterator_init_s)}, "
-            f"first batch {_fmt_ms(summary.median_first_batch_s)}, "
-            f"worker shutdown {_fmt_ms(summary.median_worker_shutdown_s)}, "
-            f"loader cleanup {_fmt_ms(summary.median_loader_cleanup_s)}",
-            f"  observed memory: {memory}",
-            f"  {improvement}",
         ]
+        if self.search_trace is not None:
+            lines.extend(["", "Search", f"  {self.search_trace.summary()}"])
+        if self.budget:
+            lines.extend(
+                [
+                    "",
+                    "Budget",
+                    f"  {_budget_text(self.budget)}",
+                ]
+            )
+        if self.profitability is not None:
+            lines.extend(["", "Profitability", f"  {self.profitability.summary()}"])
+        if self.cache:
+            cache_text = (
+                "hit" if self.cache.get("hit") else str(self.cache.get("reason", "disabled"))
+            )
+            lines.extend(
+                [
+                    "",
+                    "Cache",
+                    f"  policy: {self.cache.get('policy', 'off')}; status: {cache_text}",
+                ]
+            )
+        lines.extend(
+            [
+                "",
+                "Measured performance",
+                f"  median throughput: {summary.median_throughput:,.1f} {throughput_label}",
+                f"  throughput range: {summary.min_throughput:,.1f} - "
+                f"{summary.max_throughput:,.1f} {throughput_label}",
+                f"  median batch latency: {_fmt_ms(summary.median_latency_s)} "
+                f"(p95 {_fmt_ms(summary.p95_latency_s)})",
+                f"  startup to first batch: {_fmt_ms(summary.median_startup_s)} "
+                f"(cold start {cold_start})",
+                f"  amortized trial throughput: "
+                f"{_fmt_optional_throughput(summary.median_amortized_throughput)}",
+                f"  median total trial wall: {_fmt_ms(summary.median_total_elapsed_s)}",
+                f"  lifecycle: iterator {_fmt_ms(summary.median_iterator_init_s)}, "
+                f"first batch {_fmt_ms(summary.median_first_batch_s)}, "
+                f"worker shutdown {_fmt_ms(summary.median_worker_shutdown_s)}, "
+                f"loader cleanup {_fmt_ms(summary.median_loader_cleanup_s)}",
+                f"  observed memory: {memory}",
+                f"  {improvement}",
+            ]
+        )
         if summary.median_sustained_throughput is not None and self.settings.epochs > 1:
             lines.append(
                 f"  sustained throughput: {summary.median_sustained_throughput:,.1f} "
@@ -324,7 +412,7 @@ class OptimizationResult:
             baseline_payload["training_summary"] = training_baseline.summary.to_dict()
             baseline_payload["training_config"] = training_baseline.config.to_dict()
         return {
-            "schema_version": 4,
+            "schema_version": 5,
             "apdo_version": self.version,
             "started_at_utc": self.started_at.isoformat(),
             "duration_s": self.duration_s,
@@ -348,9 +436,22 @@ class OptimizationResult:
                 "statistical_alpha": self.validation.statistical_alpha,
                 "time_budget_s": self.settings.time_budget_s,
                 "budget_exhausted": self.budget_exhausted,
+                "search_strategy": self.settings.search_strategy,
+                "planned_epochs": self.settings.planned_epochs,
+                "planned_sessions": self.settings.planned_sessions,
+                "cache_policy": self.settings.cache_policy,
+                "cache_key": self.settings.cache_key,
                 "measured_orders": measured_orders,
                 "warmup_orders": warmup_orders,
             },
+            "budget": self.budget,
+            "search_trace": (
+                self.search_trace.to_dict() if self.search_trace is not None else None
+            ),
+            "profitability": (
+                self.profitability.to_dict() if self.profitability is not None else None
+            ),
+            "cache": self.cache,
             "benchmark_mode": self.settings.benchmark_mode,
             "epochs": self.settings.epochs,
             "environment": self.environment.to_dict(),
@@ -361,6 +462,7 @@ class OptimizationResult:
             "limitations": list(LIMITATIONS),
             "baseline": baseline_payload,
             "search": {
+                "strategy": self.settings.search_strategy,
                 "recommended_config": self.search_candidate_config.to_dict(),
                 "fastest_config": self.fastest_config.to_dict(),
                 "improvement_percent": self.search_improvement_percent,
@@ -383,6 +485,7 @@ class OptimizationResult:
                     else "loader"
                 ),
                 "epochs": self.settings.epochs,
+                "cache_hit": bool(self.cache.get("hit")),
             },
             "training": self._training_details(),
             "validation": self.validation.to_dict(),
@@ -617,6 +720,18 @@ class OptimizationResult:
                 if self.environment.cpu_affinity_count is not None
                 else "n/a",
             ),
+            ("Effective CPUs", str(self.environment.effective_cpu_count)),
+            ("Multiprocessing", self.environment.multiprocessing_start_method),
+            (
+                "Cgroup memory limit",
+                _fmt_mib(self.environment.cgroup_memory_limit_bytes),
+            ),
+            (
+                "Cgroup CPU limit",
+                f"{self.environment.cgroup_cpu_limit:.2f}"
+                if self.environment.cgroup_cpu_limit is not None
+                else "n/a",
+            ),
             ("System memory", _fmt_mib(self.environment.total_memory_bytes)),
             (
                 "CUDA",
@@ -666,8 +781,12 @@ class OptimizationResult:
             ("Validation policy", self.settings.validation_policy),
             ("Timing profile", self.settings.timing_profile),
             ("Selection metric", self.settings.selection_metric),
+            ("Search strategy", self.settings.search_strategy),
             ("Comparability policy", self.settings.comparability_policy),
             ("Sample fingerprint", "enabled" if self.settings.sample_fingerprint else "disabled"),
+            ("Cache policy", self.settings.cache_policy),
+            ("Planned epochs", str(self.settings.planned_epochs or "not specified")),
+            ("Planned sessions", str(self.settings.planned_sessions)),
             ("Reproducibility", self.settings.reproducibility_status),
             (
                 "Minimum improvement",
@@ -699,6 +818,10 @@ class OptimizationResult:
         )
         limitations_html = "\n".join(f"<li>{escape(item)}</li>" for item in LIMITATIONS)
         validation_html = self._validation_html()
+        search_html = self._search_html()
+        budget_html = self._budget_html()
+        profitability_html = self._profitability_html()
+        cache_html = self._cache_html()
         timing_html = self._timing_html()
         comparability_html = self._comparability_html()
         order_html = self._order_html()
@@ -732,6 +855,14 @@ mode {escape(self.settings.benchmark_mode)} &middot;
 </section>
 
 {validation_html}
+
+{search_html}
+
+{budget_html}
+
+{profitability_html}
+
+{cache_html}
 
 {comparability_html}
 
@@ -807,6 +938,98 @@ requires no network access. Throughput is {escape(throughput_label)} in
             "<p><strong>No validated gain.</strong> The initial configuration is retained. "
             f"{escape(validation.reason)}</p>"
         )
+
+    def _search_html(self) -> str:
+        if self.search_trace is None:
+            return ""
+        escape = html.escape
+        rows = []
+        for stage in self.search_trace.stages:
+            for candidate in stage.candidates:
+                rows.append(
+                    f"<tr><td>{escape(stage.name)}</td>"
+                    f"<td><code>{escape(candidate.config.describe())}</code></td>"
+                    f"<td>{escape(candidate.status)}</td>"
+                    f"<td>{candidate.measured_rounds}</td>"
+                    f"<td>{escape(candidate.reason or '')}</td></tr>"
+                )
+        rows_html = "".join(rows)
+        table_html = ""
+        if rows_html:
+            table_html = (
+                '<div class="table-wrap"><table><thead><tr>'
+                "<th>Stage</th><th>Configuration</th><th>Status</th>"
+                "<th>Measured rounds</th><th>Reason</th>"
+                f"</tr></thead><tbody>{rows_html}</tbody></table></div>"
+            )
+        return f"""<section>
+<h2>Search strategy</h2>
+<p>{escape(self.search_trace.summary())}</p>
+<p class="muted">Adaptive search promotes promising configurations through deterministic
+screening and refinement. Cache hits never count as validation evidence.</p>
+{table_html}
+</section>"""
+
+    def _budget_html(self) -> str:
+        if not self.budget:
+            return ""
+        escape = html.escape
+        budget = self.budget
+        status = escape(str(budget.get("status", "unknown")))
+        summary = escape(_budget_text(budget))
+        next_trial = escape(_fmt_ms(budget.get("estimated_next_trial_s")))
+        measured = escape(str(budget.get("measured_trials", 0)))
+        skipped = escape(str(budget.get("skipped_trials", 0)))
+        return f"""<section>
+<h2>Budget</h2>
+<div class="table-wrap"><table class="kv"><tbody>
+<tr><th>Status</th><td>{status}</td></tr>
+<tr><th>Total budget</th><td>{summary}</td></tr>
+<tr><th>Estimated next trial</th><td>{next_trial}</td></tr>
+<tr><th>Measured trials</th><td>{measured}</td></tr>
+<tr><th>Skipped trials</th><td>{skipped}</td></tr>
+</tbody></table></div>
+</section>"""
+
+    def _profitability_html(self) -> str:
+        if self.profitability is None:
+            return ""
+        escape = html.escape
+        estimate = self.profitability
+        status = escape(estimate.status)
+        scope = escape(estimate.scope)
+        cost = escape(_fmt_ms(estimate.optimization_cost_s))
+        saved = escape(_fmt_ms(estimate.saved_per_epoch_s))
+        net = escape(_fmt_ms(estimate.net_savings_s))
+        break_even = escape(_fmt_optional_number(estimate.break_even_epochs))
+        summary = escape(estimate.summary())
+        return f"""<section>
+<h2>Profitability</h2>
+<div class="metrics">
+<div class="metric"><span>Status</span><strong>{status}</strong></div>
+<div class="metric"><span>Scope</span><strong>{scope}</strong></div>
+<div class="metric"><span>Optimization cost</span><strong>{cost}</strong></div>
+<div class="metric"><span>Saved per epoch</span><strong>{saved}</strong></div>
+<div class="metric"><span>Net savings</span><strong>{net}</strong></div>
+<div class="metric"><span>Break-even epochs</span><strong>{break_even}</strong></div>
+</div>
+<p>{summary}</p>
+</section>"""
+
+    def _cache_html(self) -> str:
+        if not self.cache:
+            return ""
+        escape = html.escape
+        status = "hit" if self.cache.get("hit") else str(self.cache.get("reason", "disabled"))
+        return f"""<section>
+<h2>Cache</h2>
+<div class="table-wrap"><table class="kv"><tbody>
+<tr><th>Policy</th><td>{escape(str(self.cache.get("policy", "off")))}</td></tr>
+<tr><th>Status</th><td>{escape(status)}</td></tr>
+<tr><th>Key</th><td>{escape(str(self.cache.get("key") or "derived"))}</td></tr>
+<tr><th>Stored</th><td>{escape(str(self.cache.get("stored", "not written")))}</td></tr>
+</tbody></table></div>
+</section>"""
 
     def _validation_html(self) -> str:
         escape = html.escape
@@ -1354,6 +1577,19 @@ footer {
 """
 
 
+def _budget_text(budget: dict[str, Any]) -> str:
+    if budget.get("budget_s") is None:
+        return f"unlimited ({budget.get('status', 'unlimited')})"
+    return (
+        f"{budget.get('budget_s'):.2f} s total, "
+        f"{budget.get('remaining_s') or 0.0:.2f} s remaining "
+        f"({budget.get('status', 'unknown')}); "
+        f"search {budget.get('search_elapsed_s', 0.0):.2f} s; "
+        f"validation {budget.get('validation_elapsed_s', 0.0):.2f} s; "
+        f"skipped trials {budget.get('skipped_trials', 0)}"
+    )
+
+
 def _fmt_ms(seconds: float | None) -> str:
     if seconds is None:
         return "n/a"
@@ -1364,6 +1600,10 @@ def _fmt_mib(value: int | None) -> str:
     if value is None:
         return "n/a"
     return f"{value / (1024**2):,.1f} MiB"
+
+
+def _fmt_optional_number(value: float | None) -> str:
+    return f"{value:,.2f}" if value is not None else "n/a"
 
 
 def _fmt_optional_throughput(value: float | None) -> str:

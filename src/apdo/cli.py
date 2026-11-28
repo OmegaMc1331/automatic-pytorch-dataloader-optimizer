@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from apdo._version import __version__
+from apdo.cache import ConfigCache
 from apdo.errors import ApdoError
 from apdo.optimizer import optimize
 from apdo.stability import evaluate_stability
@@ -180,7 +181,43 @@ def build_parser() -> argparse.ArgumentParser:
         "--time-budget-s",
         type=_positive_float,
         default=None,
-        help="approximate search time budget in seconds, checked at round boundaries",
+        help="cooperative optimization time budget in seconds",
+    )
+    benchmark.add_argument(
+        "--search-strategy",
+        choices=("grid", "adaptive"),
+        default="grid",
+        help="grid search or deterministic adaptive screening/refinement (default: grid)",
+    )
+    benchmark.add_argument(
+        "--planned-epochs",
+        type=_positive_int,
+        default=None,
+        help="future epoch horizon for the profitability estimate",
+    )
+    benchmark.add_argument(
+        "--planned-sessions",
+        type=_positive_int,
+        default=1,
+        help="future training sessions for the profitability estimate (default: 1)",
+    )
+    benchmark.add_argument(
+        "--cache-policy",
+        choices=("off", "hint", "revalidate"),
+        default="off",
+        help="local recommendation cache behavior (default: off)",
+    )
+    benchmark.add_argument(
+        "--cache-key",
+        default=None,
+        help="explicit cache key; otherwise a deterministic identity is used",
+    )
+    benchmark.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="local cache directory (default: ~/.apdo/cache)",
     )
     benchmark.add_argument(
         "--sample-count-fn",
@@ -322,6 +359,13 @@ def build_parser() -> argparse.ArgumentParser:
     stability.add_argument(
         "--comparability-policy", choices=("off", "warn", "strict"), default="warn"
     )
+    stability.add_argument("--time-budget-s", type=_positive_float, default=None)
+    stability.add_argument("--search-strategy", choices=("grid", "adaptive"), default="grid")
+    stability.add_argument("--planned-epochs", type=_positive_int, default=None)
+    stability.add_argument("--planned-sessions", type=_positive_int, default=1)
+    stability.add_argument("--cache-policy", choices=("off", "hint", "revalidate"), default="off")
+    stability.add_argument("--cache-key", default=None)
+    stability.add_argument("--cache-dir", type=Path, default=None, metavar="PATH")
     stability.add_argument(
         "--runs",
         type=_positive_int,
@@ -338,6 +382,23 @@ def build_parser() -> argparse.ArgumentParser:
     stability.add_argument("--json", dest="json_path", type=Path, default=None, metavar="PATH")
     stability.add_argument("--html", dest="html_path", type=Path, default=None, metavar="PATH")
     stability.set_defaults(handler=_run_stability, validation=True)
+    cache = subparsers.add_parser(
+        "cache",
+        help="inspect or clear the local recommendation cache",
+        description="Inspect or clear the opt-in local recommendation cache.",
+    )
+    cache_commands = cache.add_subparsers(dest="cache_command", metavar="command", required=True)
+    cache_list = cache_commands.add_parser("list", help="list cached recommendations")
+    cache_list.add_argument("--directory", type=Path, default=None, metavar="PATH")
+    cache_list.set_defaults(handler=_run_cache)
+    cache_clear = cache_commands.add_parser("clear", help="delete cached recommendations")
+    cache_clear.add_argument("--directory", type=Path, default=None, metavar="PATH")
+    cache_clear.add_argument(
+        "--yes",
+        action="store_true",
+        help="confirm deletion of all cached recommendations",
+    )
+    cache_clear.set_defaults(handler=_run_cache)
     return parser
 
 
@@ -406,6 +467,12 @@ def _run_benchmark(args: argparse.Namespace) -> int:
             validation_rounds=args.validation_rounds,
             min_improvement=args.min_improvement,
             time_budget_s=args.time_budget_s,
+            search_strategy=args.search_strategy,
+            planned_epochs=args.planned_epochs,
+            planned_sessions=args.planned_sessions,
+            cache_policy=args.cache_policy,
+            cache_key=args.cache_key,
+            cache_directory=args.cache_dir,
             sample_count_fn=sample_count_fn,
             timing_profile=args.timing_profile,
             selection_metric=args.selection_metric,
@@ -485,6 +552,13 @@ def _run_stability(args: argparse.Namespace) -> int:
             validation=args.validation,
             validation_rounds=args.validation_rounds,
             min_improvement=args.min_improvement,
+            time_budget_s=args.time_budget_s,
+            search_strategy=args.search_strategy,
+            planned_epochs=args.planned_epochs,
+            planned_sessions=args.planned_sessions,
+            cache_policy=args.cache_policy,
+            cache_key=args.cache_key,
+            cache_directory=args.cache_dir,
             sample_count_fn=sample_count_fn,
             timing_profile=args.timing_profile,
             selection_metric=args.selection_metric,
@@ -514,6 +588,41 @@ def _run_stability(args: argparse.Namespace) -> int:
         print(f"apdo: could not write stability report: {exc}", file=sys.stderr)
         return 1
     return 0 if report.summary.runs_succeeded else 1
+
+
+def _run_cache(args: argparse.Namespace) -> int:
+    cache = ConfigCache(args.directory)
+    if args.cache_command == "list":
+        entries = cache.list_entries()
+        if not entries:
+            print(f"No cached recommendations in {cache.directory}")
+            return 0
+        print(f"Cached recommendations in {cache.directory}: {len(entries)}")
+        for entry in entries:
+            gain = (
+                f"{entry.improvement_percent:+.1f}%"
+                if entry.improvement_percent is not None
+                else "n/a"
+            )
+            print(
+                f"  {entry.created_at}  {entry.key[:12]}  "
+                f"{entry.validation_status}  gain={gain}  "
+                f"{entry.recommended_config.describe()}"
+            )
+        return 0
+    if not args.yes:
+        print(
+            "apdo: cache clear requires --yes to delete cached recommendations",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        removed = cache.clear()
+    except OSError as exc:
+        print(f"apdo: could not clear cache: {exc}", file=sys.stderr)
+        return 1
+    print(f"Removed {removed} cached recommendation(s) from {cache.directory}")
+    return 0
 
 
 def _load_dataset(specification: str) -> Any:

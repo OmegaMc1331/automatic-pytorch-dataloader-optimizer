@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import ctypes
+import multiprocessing
 import os
 import platform
 import sys
@@ -46,6 +48,10 @@ class EnvironmentInfo:
     total_memory_bytes: int | None
     available_memory_bytes: int | None
     torch_num_threads: int
+    effective_cpu_count: int
+    multiprocessing_start_method: str
+    cgroup_memory_limit_bytes: int | None
+    cgroup_cpu_limit: float | None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -56,6 +62,8 @@ class EnvironmentInfo:
             "processor": self.processor,
             "cpu_count": self.cpu_count,
             "cpu_affinity_count": self.cpu_affinity_count,
+            "effective_cpu_count": self.effective_cpu_count,
+            "multiprocessing_start_method": self.multiprocessing_start_method,
             "torch_version": self.torch_version,
             "cuda_available": self.cuda_available,
             "cuda_version": self.cuda_version,
@@ -63,6 +71,8 @@ class EnvironmentInfo:
             "total_memory_bytes": self.total_memory_bytes,
             "available_memory_bytes": self.available_memory_bytes,
             "torch_num_threads": self.torch_num_threads,
+            "cgroup_memory_limit_bytes": self.cgroup_memory_limit_bytes,
+            "cgroup_cpu_limit": self.cgroup_cpu_limit,
         }
 
 
@@ -195,20 +205,81 @@ def process_rss_bytes() -> int | None:
     return None
 
 
-def available_cpu_count() -> int:
-    if hasattr(os, "sched_getaffinity"):
+def _read_text(path: str) -> str | None:
+    try:
+        with open(path, encoding="ascii") as handle:
+            return handle.read().strip()
+    except OSError:
+        return None
+
+
+def cgroup_memory_limit_bytes() -> int | None:
+    value = _read_text("/sys/fs/cgroup/memory.max")
+    if value is not None:
+        if value == "max":
+            return None
         try:
-            return max(1, len(os.sched_getaffinity(0)))
-        except OSError:
-            pass
+            limit = int(value)
+        except ValueError:
+            limit = None
+        else:
+            if 0 < limit < (1 << 60):
+                return limit
 
-    process_cpu_count = getattr(os, "process_cpu_count", None)
-    if callable(process_cpu_count):
-        value = process_cpu_count()
-        if value:
-            return int(value)
+    value = _read_text("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    if value is not None:
+        try:
+            limit = int(value)
+        except ValueError:
+            return None
+        if 0 < limit < (1 << 60):
+            return limit
+    return None
 
-    return max(1, os.cpu_count() or 1)
+
+def cgroup_cpu_limit() -> float | None:
+    value = _read_text("/sys/fs/cgroup/cpu.max")
+    if value is not None:
+        quota_text, _, period_text = value.partition(" ")
+        if quota_text != "max":
+            try:
+                quota = int(quota_text)
+                period = int(period_text)
+            except ValueError:
+                quota = 0
+                period = 0
+            if quota > 0 and period > 0:
+                return quota / period
+
+    quota_text = _read_text("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+    period_text = _read_text("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+    if quota_text is not None and period_text is not None:
+        try:
+            quota = int(quota_text)
+            period = int(period_text)
+        except ValueError:
+            return None
+        if quota > 0 and period > 0:
+            return quota / period
+    return None
+
+
+def available_cpu_count() -> int:
+    limit = os.cpu_count() or 1
+    if hasattr(os, "sched_getaffinity"):
+        with contextlib.suppress(OSError):
+            limit = len(os.sched_getaffinity(0))
+    else:
+        process_cpu_count = getattr(os, "process_cpu_count", None)
+        if callable(process_cpu_count):
+            value = process_cpu_count()
+            if value:
+                limit = int(value)
+
+    cpu_limit = cgroup_cpu_limit()
+    if cpu_limit is not None:
+        limit = min(limit, max(1, int(cpu_limit)))
+    return max(1, limit)
 
 
 def collect_environment() -> EnvironmentInfo:
@@ -245,6 +316,8 @@ def collect_environment() -> EnvironmentInfo:
         processor=platform.processor(),
         cpu_count=os.cpu_count() or 1,
         cpu_affinity_count=affinity_count,
+        effective_cpu_count=available_cpu_count(),
+        multiprocessing_start_method=multiprocessing.get_start_method(allow_none=True) or "default",
         torch_version=torch.__version__,
         cuda_available=cuda_available,
         cuda_version=torch.version.cuda,
@@ -252,6 +325,8 @@ def collect_environment() -> EnvironmentInfo:
         total_memory_bytes=total_memory,
         available_memory_bytes=available_memory,
         torch_num_threads=torch.get_num_threads(),
+        cgroup_memory_limit_bytes=cgroup_memory_limit_bytes(),
+        cgroup_cpu_limit=cgroup_cpu_limit(),
     )
 
 

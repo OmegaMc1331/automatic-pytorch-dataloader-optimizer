@@ -7,6 +7,8 @@ import pytest
 from apdo.resources import (
     MemoryMonitor,
     available_cpu_count,
+    cgroup_cpu_limit,
+    cgroup_memory_limit_bytes,
     collect_environment,
     process_rss_bytes,
     system_memory_bytes,
@@ -23,9 +25,22 @@ def test_environment_collection() -> None:
     assert environment.python_version
     assert environment.torch_version
     assert environment.cpu_count >= 1
+    assert environment.effective_cpu_count >= 1
     assert environment.torch_num_threads >= 1
+    assert environment.multiprocessing_start_method
     assert isinstance(environment.to_dict(), dict)
     assert environment.to_dict()["cuda_available"] == environment.cuda_available
+    assert environment.to_dict()["effective_cpu_count"] >= 1
+
+
+def test_cgroup_limits_are_plausible() -> None:
+    memory_limit = cgroup_memory_limit_bytes()
+    cpu_limit = cgroup_cpu_limit()
+
+    if memory_limit is not None:
+        assert memory_limit > 0
+    if cpu_limit is not None:
+        assert cpu_limit > 0
 
 
 def test_memory_helpers_return_plausible_values() -> None:

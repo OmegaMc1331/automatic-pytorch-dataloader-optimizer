@@ -5,12 +5,14 @@ from typing import Any
 
 from apdo.errors import ConfigurationError
 
-BENCHMARK_PROTOCOL_VERSION = "4.1"
+BENCHMARK_PROTOCOL_VERSION = "5.0"
 BENCHMARK_MODES = ("loader", "training")
 VALIDATION_POLICIES = ("minimum", "positive")
 TIMING_PROFILES = ("standard", "detailed")
 SELECTION_METRICS = ("sustained", "amortized")
 COMPARABILITY_POLICIES = ("off", "warn", "strict")
+SEARCH_STRATEGIES = ("grid", "adaptive")
+CACHE_POLICIES = ("off", "hint", "revalidate")
 MAX_BENCHMARK_EPOCHS = 20
 
 
@@ -114,6 +116,11 @@ class BenchmarkSettings:
     selection_metric: str = "sustained"
     comparability_policy: str = "warn"
     sample_fingerprint: bool = False
+    search_strategy: str = "grid"
+    planned_epochs: int | None = None
+    planned_sessions: int = 1
+    cache_policy: str = "off"
+    cache_key: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -148,4 +155,9 @@ class BenchmarkSettings:
             "selection_metric": self.selection_metric,
             "comparability_policy": self.comparability_policy,
             "sample_fingerprint": self.sample_fingerprint,
+            "search_strategy": self.search_strategy,
+            "planned_epochs": self.planned_epochs,
+            "planned_sessions": self.planned_sessions,
+            "cache_policy": self.cache_policy,
+            "cache_key": self.cache_key,
         }

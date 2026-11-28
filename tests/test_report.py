@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from apdo import LoaderConfig
+from apdo.search import SearchCandidate, SearchStage, SearchTrace
 from tests.helpers import (
     make_failed_measurement,
     make_measurement,
@@ -53,8 +54,8 @@ def test_json_export(result, tmp_path: Path) -> None:
     result.to_json(target)
 
     payload = json.loads(target.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 4
-    assert payload["apdo_version"] == "0.4.1"
+    assert payload["schema_version"] == 5
+    assert payload["apdo_version"] == "0.5.0"
     assert payload["protocol"]["seed"] == 42
     assert payload["protocol"]["search_rounds"] == 3
     assert payload["recommended"]["config"]["num_workers"] == 1
@@ -62,6 +63,12 @@ def test_json_export(result, tmp_path: Path) -> None:
     assert payload["protocol"]["timing_profile"] == "standard"
     assert payload["protocol"]["selection_metric"] == "sustained"
     assert payload["protocol"]["comparability_policy"] == "warn"
+    assert payload["protocol"]["search_strategy"] == "grid"
+    assert payload["protocol"]["cache_policy"] == "off"
+    assert payload["budget"] == {}
+    assert payload["search_trace"] is None
+    assert payload["profitability"] is None
+    assert payload["cache"] == {}
     assert payload["timing"]["timing_profile"] == "standard"
     assert payload["comparability"] is None
     assert payload["recommended"]["validation_status"] == "confirmed"
@@ -82,6 +89,61 @@ def test_json_export(result, tmp_path: Path) -> None:
     assert len(recommended) == 1
     assert recommended[0]["rank"] == 2
     assert "http://" not in target.read_text(encoding="utf-8")
+
+
+def test_report_exposes_v05_sections(result, tmp_path: Path) -> None:
+    trace = SearchTrace(
+        strategy="adaptive",
+        stages=(
+            SearchStage(
+                name="screening",
+                planned_rounds=2,
+                candidates=(
+                    SearchCandidate(
+                        config=result.search_candidate_config,
+                        status="finalist",
+                        phase="worker_scan",
+                        measured_rounds=2,
+                    ),
+                ),
+            ),
+        ),
+        selected_config=result.search_candidate_config,
+        fastest_config=result.fastest_config,
+    )
+    result = replace(
+        result,
+        budget={
+            "budget_s": 30.0,
+            "status": "available",
+            "remaining_s": 12.0,
+            "search_elapsed_s": 10.0,
+            "validation_elapsed_s": 8.0,
+            "skipped_trials": 1,
+            "measured_trials": 5,
+        },
+        search_trace=trace,
+        profitability=result.estimate_profitability(planned_epochs=10),
+        cache={"policy": "hint", "hit": True, "reason": "cache entry matched"},
+    )
+
+    payload = result.to_dict()
+    text = result.summary()
+    html = result.to_html(tmp_path / "v05.html")
+    rendered = (tmp_path / "v05.html").read_text(encoding="utf-8")
+
+    assert payload["budget"]["status"] == "available"
+    assert payload["search_trace"]["strategy"] == "adaptive"
+    assert payload["profitability"]["planned_epochs"] == 10
+    assert payload["cache"]["hit"] is True
+    assert "Search strategy: adaptive" in text
+    assert "Budget" in text
+    assert "Profitability" in text
+    assert "Cache" in text
+    assert "Search strategy" in rendered
+    assert "Budget" in rendered
+    assert "Profitability" in rendered
+    assert html is None
 
 
 def test_html_export_is_standalone_and_escaped(result, tmp_path: Path) -> None:
@@ -146,7 +208,7 @@ def test_training_report_exposes_end_to_end_metrics(tmp_path: Path) -> None:
     html = target.read_text(encoding="utf-8")
     text = result.summary()
 
-    assert payload["schema_version"] == 4
+    assert payload["schema_version"] == 5
     assert payload["search"]["throughput_kind"] == "end_to_end_training"
     assert payload["training"]["epochs"] == 3
     assert payload["training"]["selected"]["summary"]["median_throughput"] == 120.0

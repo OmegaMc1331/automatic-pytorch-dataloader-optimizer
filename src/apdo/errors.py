@@ -20,3 +20,7 @@ class MemoryLimitExceeded(BenchmarkError):
 
 class FingerprintError(ApdoError, ValueError):
     pass
+
+
+class BudgetExhausted(ApdoError, RuntimeError):
+    pass

@@ -16,7 +16,7 @@ DataLoader throughput depends on the dataset, storage, preprocessing cost, CPU t
 
 APDO runs the real loader, records repeated measurements, validates the search recommendation with fresh measurements, and retains the initial configuration when a gain is not confirmed. It does not estimate performance from hardware specifications and does not call a cloud service.
 
-## Features in v0.4.1
+## Features in v0.5.0
 
 - Optimizes a map-style dataset with a batch size, an existing `DataLoader`, or a config-aware loader factory.
 - Measures repeated epochs in one trial and reports iterator initialization, first-batch acquisition, worker shutdown, loader cleanup, epoch transitions, sustained throughput, and total trial wall separately.
@@ -30,20 +30,25 @@ APDO runs the real loader, records repeated measurements, validates the search r
 - Isolates supported loader generators and samplers, restores Python/Torch/NumPy/CUDA RNG state after each trial, and reports a reproducibility status.
 - Runs seeded, balanced rounds and records the executed configuration order and every per-round measurement.
 - Reports worker PIDs, process RSS, data-wait time, host-to-device transfer time, training-step latency, and epoch-transition overhead.
+- Reports effective CPU count, CPU affinity, cgroup memory/CPU limits, and the multiprocessing start method; caps worker search by effective CPU availability.
 - Runs independent paired validation with a configurable `minimum` or `positive` policy instead of treating the search result as proof.
 - Requires at least eight valid paired observations, an exact one-sided paired sign test, and the selected policy's interval condition before confirming a gain.
 - Uses the selected metric consistently for worker finalists, training candidates, the search recommendation, and the report.
 - Falls back to the initial configuration unless validation confirms the required minimum gain.
-- Supports optional time budgets and custom sample counting for unusual collate functions.
-- Generates a schema-v4 JSON report and a self-contained HTML report with lifecycle timing, comparability, training metrics, reproducibility, validation, ranking, execution order, environment, method, and limitations.
+- Supports cooperative time budgets with validation reservation and explicit skipped-trial accounting.
+- Offers grid search by default and an adaptive screening/refinement strategy that records search-stage decisions.
+- Estimates profitability for a planned epoch and session horizon, with conservative and optimistic bounds.
+- Supports an opt-in local JSON cache (`off`, `hint`, `revalidate`) whose hits never replace fresh validation.
+- Supports custom sample counting for unusual collate functions.
+- Generates a schema-v5 JSON report and a self-contained HTML report with lifecycle timing, comparability, search trace, budget, profitability, cache, training metrics, reproducibility, validation, ranking, execution order, environment, method, and limitations.
 - Provides six deterministic local workloads, including startup-bound, compute-bound, and real training workloads, without adding slow benchmarks to CI.
 
 ## Installation
 
-v0.4.1 is distributed through GitHub Releases. PyPI publication is not part of this release.
+v0.5.0 is distributed through GitHub Releases. PyPI publication is not part of this release.
 
 ```bash
-pip install "git+https://github.com/OmegaMc1331/automatic-pytorch-dataloader-optimizer.git@v0.4.1"
+pip install "git+https://github.com/OmegaMc1331/automatic-pytorch-dataloader-optimizer.git@v0.5.0"
 ```
 
 For development from a clone:
@@ -86,6 +91,39 @@ print(result.summary())
 optimized_loader = result.build_dataloader()
 batch = next(iter(optimized_loader))
 ```
+
+## Adaptive search, budgets, cache, and profitability
+
+Grid search remains the default. Adaptive search screens worker counts with fewer rounds and refines one worker finalist before the same independent validation gate:
+
+```python
+result = optimize(
+    dataset,
+    batch_size=32,
+    search_strategy="adaptive",
+    time_budget_s=120,
+    planned_epochs=50,
+    planned_sessions=1,
+    cache_policy="hint",
+)
+
+print(result.search_trace.summary())
+print(result.budget["status"])
+print(result.profitability.summary())
+```
+
+A budget is cooperative: APDO checks it at measured round boundaries, reserves capacity for validation, and never treats partial evidence as confirmation. `result.estimate_profitability(planned_epochs=100, planned_sessions=2)` can be called later with a different horizon.
+
+For one-epoch or startup-sensitive workloads, use `selection_metric="amortized"`. A candidate can pass sustained-throughput validation while making the complete trial slower; the report warns when that divergence is material, and the profitability estimate can mark the recommendation `not_profitable`.
+
+The cache is opt-in and local. `hint` uses a matching recommendation to focus search but still validates fresh; `revalidate` behaves similarly with explicit revalidation semantics; `off` disables cache access. Inspect or clear it with:
+
+```bash
+apdo cache list
+apdo cache clear --yes
+```
+
+Cache entries are JSON only, bounded, and include protocol, package, environment, source, and validation evidence. Corrupt or stale entries are ignored.
 
 ## Python quick start: existing DataLoader
 
@@ -344,6 +382,12 @@ Useful options:
 - `--min-improvement`
 - `--no-validation`
 - `--time-budget-s`
+- `--search-strategy grid|adaptive`
+- `--planned-epochs N`
+- `--planned-sessions N`
+- `--cache-policy off|hint|revalidate`
+- `--cache-key KEY`
+- `--cache-dir PATH`
 - `--sample-count-fn MODULE:FACTORY`
 - `--max-batches` or `--full-dataset`
 - `--max-workers`
@@ -352,10 +396,11 @@ Useful options:
 
 ## Reports
 
-JSON reports use schema version 4 and include:
+JSON reports use schema version 5 and include:
 
-- APDO version, start time, duration, protocol version 4.1, benchmark mode, epochs, seed, rounds, timing profile, selection metric, comparability policy, budget state, and executed search/validation orders.
+- APDO version, start time, duration, protocol version 5.0, benchmark mode, epochs, seed, rounds, timing profile, selection metric, comparability policy, search strategy, cache policy, budget state, and executed search/validation orders.
 - Lifecycle timing for construction, iterator initialization, first batch, worker shutdown, loader cleanup, total trial wall, sustained throughput, and amortized throughput.
+- Search strategy, per-stage candidate statuses, budget status and category timing, profitability bounds, and cache status.
 - Batch structure and optional sample-fingerprint comparability results.
 - Environment, benchmark settings, loader preservation details, reproducibility status and risks, method, and limitations.
 - Baseline, search recommendation, fastest configuration, final recommendation, validation status, policy, and final gain.
@@ -440,7 +485,8 @@ python -m twine check dist/*
 - v0.3.0 adds training mode, loader factories, multi-epoch metrics, reproducibility reporting, and JSON schema version 3 with protocol version 3.0.
 - v0.4.0 adds explicit lifecycle timing, amortized selection, detailed CUDA timing, batch comparability diagnostics, stability reports, and JSON schema version 4 with protocol version 4.0.
 - v0.4.1 adds metric-consistent selection and ranking, the eight-pair validation minimum with an exact paired sign test, explicit rejection of invalid validation observations, complete budget-truncated validation evidence, corrected startup-bound and compute-bound workloads, and confirmed-versus-fallback stability statistics with protocol version 4.1.
-- The two-stage search, bootstrap selection, memory guard, CUDA transfer measurement, CLI, and reports remain available.
+- v0.5.0 adds adaptive screening, cooperative budget categories and validation reservation, profitability estimates, an opt-in local JSON cache, search traces, schema version 5, and protocol version 5.0.
+- The grid or adaptive search, bootstrap selection, memory guard, CUDA transfer measurement, CLI, and reports remain available.
 - Only map-style datasets with `__len__` and `__getitem__` are supported.
 - Loader mode measures data loading; it does not measure model training. Training mode measures the user-supplied model step, so model architecture and device work affect the result.
 - Validation confirms a gain for the measured workload and policy; it is not a universal guarantee.

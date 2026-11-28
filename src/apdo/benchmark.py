@@ -9,6 +9,7 @@ from typing import Any
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from apdo.budget import BudgetController
 from apdo.comparability import BatchObservations, batch_fingerprint, batch_structure
 from apdo.config import MAX_BENCHMARK_EPOCHS, TIMING_PROFILES, LoaderConfig
 from apdo.errors import ConfigurationError, DatasetError, FingerprintError
@@ -72,6 +73,7 @@ class ConfigMeasurement:
     memory: MemorySnapshot | None = None
     epochs: int = 1
     training: bool = False
+    budget_limited: bool = False
 
     @property
     def succeeded(self) -> bool:
@@ -91,6 +93,7 @@ class ConfigMeasurement:
             "gpu_transfer_active": self.gpu_transfer_active,
             "epochs": self.epochs,
             "training": self.training,
+            "budget_limited": self.budget_limited,
             "passes": [item.to_dict() for item in self.passes],
             "rounds": [item.to_dict() for item in self.rounds],
         }
@@ -120,6 +123,8 @@ class _Accumulator:
     gpu_peaks: list[int] = field(default_factory=list)
     gpu_transfer_active: bool = False
     failure: tuple[str, str] | None = None
+    budget_limited: bool = False
+    skipped: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +135,7 @@ class _PassExecution:
     gpu_peak_bytes: int | None
     gpu_transfer_active: bool
     error: tuple[str, str] | None
+    duration_s: float
 
 
 def dataset_length(dataset: Dataset) -> int:
@@ -194,6 +200,8 @@ def benchmark_config(
     timing_profile: str = "standard",
     fingerprint_fn: Callable[[Any], Any] | None = None,
     collect_comparability: bool = True,
+    budget: BudgetController | None = None,
+    budget_category: str = "search",
 ) -> ConfigMeasurement:
     template = LoaderTemplate.from_dataset(
         dataset,
@@ -216,6 +224,8 @@ def benchmark_config(
         timing_profile=timing_profile,
         fingerprint_fn=fingerprint_fn,
         collect_comparability=collect_comparability,
+        budget=budget,
+        budget_category=budget_category,
     )
     return stage.measurements[0]
 
@@ -238,6 +248,8 @@ def benchmark_rounds(
     timing_profile: str = "standard",
     fingerprint_fn: Callable[[Any], Any] | None = None,
     collect_comparability: bool = True,
+    budget: BudgetController | None = None,
+    budget_category: str = "search",
 ) -> StageResult:
     source = LoaderSource.from_template(template, "dataloader")
     return benchmark_source(
@@ -257,6 +269,8 @@ def benchmark_rounds(
         timing_profile=timing_profile,
         fingerprint_fn=fingerprint_fn,
         collect_comparability=collect_comparability,
+        budget=budget,
+        budget_category=budget_category,
     )
 
 
@@ -278,6 +292,8 @@ def benchmark_source(
     timing_profile: str = "standard",
     fingerprint_fn: Callable[[Any], Any] | None = None,
     collect_comparability: bool = True,
+    budget: BudgetController | None = None,
+    budget_category: str = "search",
 ) -> StageResult:
     if not configs:
         raise ConfigurationError("at least one configuration is required")
@@ -338,6 +354,8 @@ def benchmark_source(
                 fingerprint_fn=fingerprint_fn,
                 collect_comparability=False,
             )
+            if budget is not None:
+                budget.note_trial(execution.duration_s)
             _record_warmup(accumulators[config], execution)
             if execution.error is not None:
                 accumulators[config].failure = execution.error
@@ -364,8 +382,9 @@ def benchmark_source(
     for measured_order in planned_orders:
         if not active:
             break
-        if deadline is not None and measured_order.round_index > 0 and _clock() >= deadline:
+        if measured_order.round_index > 0 and _budget_expired(budget, deadline):
             budget_exhausted = True
+            _mark_unfinished(accumulators, active, budget)
             break
         executed = []
         trial_seed = derive_seed(
@@ -376,6 +395,19 @@ def benchmark_source(
         )
         for config in measured_order.configs:
             if config not in active:
+                continue
+            if (
+                budget is not None
+                and measured_order.round_index > 0
+                and not budget.can_start(budget_category, budget.estimated_next_trial_s or 0.0)
+            ):
+                budget_exhausted = True
+                accumulator = accumulators[config]
+                accumulator.budget_limited = True
+                accumulator.skipped = not accumulator.rounds
+                active.discard(config)
+                budget.mark_skipped()
+                _emit(progress, f"    skipped {config.describe()}: budget exhausted")
                 continue
             executed.append(config)
             _emit(
@@ -396,6 +428,8 @@ def benchmark_source(
                 fingerprint_fn=fingerprint_fn,
                 collect_comparability=collect_comparability,
             )
+            if budget is not None:
+                budget.note_trial(execution.duration_s)
             _record_measured(
                 accumulators[config],
                 execution,
@@ -425,13 +459,15 @@ def benchmark_source(
             max_ram_bytes,
             epochs=epochs,
             training=training,
+            budget_limited=accumulator.budget_limited,
+            skipped=accumulator.skipped,
         )
         for config, accumulator in accumulators.items()
     )
     return StageResult(
         measurements=measurements,
         orders=tuple(orders),
-        budget_exhausted=budget_exhausted,
+        budget_exhausted=budget_exhausted or (budget is not None and budget.exhausted),
     )
 
 
@@ -531,6 +567,7 @@ def _execute_trial(
         gpu_peak_bytes=gpu_peak,
         gpu_transfer_active=transfer_active,
         error=failure,
+        duration_s=max(0.0, trial_end - trial_start),
     )
 
 
@@ -896,6 +933,8 @@ def _finalize_measurement(
     *,
     epochs: int,
     training: bool,
+    budget_limited: bool,
+    skipped: bool,
 ) -> ConfigMeasurement:
     memory = _merge_memory(accumulator.memories, max_ram_bytes)
     passes = tuple(item.pass_metrics for item in accumulator.rounds)
@@ -920,16 +959,19 @@ def _finalize_measurement(
             memory=memory,
             epochs=epochs,
             training=training,
+            budget_limited=budget_limited,
         )
 
     error_type, error_message = accumulator.failure or (
-        "BenchmarkError",
-        "no measured round completed",
+        "BudgetExhausted" if budget_limited else "BenchmarkError",
+        "the time budget prevented a measured round"
+        if budget_limited
+        else "no measured round completed",
     )
     return ConfigMeasurement(
         config=config,
         phase=phase,
-        status="failed",
+        status="skipped" if skipped and not passes else "failed",
         error_type=error_type,
         error_message=error_message,
         passes=passes,
@@ -939,7 +981,27 @@ def _finalize_measurement(
         memory=memory,
         epochs=epochs,
         training=training,
+        budget_limited=budget_limited,
     )
+
+
+def _budget_expired(budget: BudgetController | None, deadline: float | None) -> bool:
+    if budget is not None and budget.expired():
+        return True
+    return deadline is not None and _clock() >= deadline
+
+
+def _mark_unfinished(
+    accumulators: dict[LoaderConfig, _Accumulator],
+    active: set[LoaderConfig],
+    budget: BudgetController | None,
+) -> None:
+    for config in active:
+        accumulator = accumulators[config]
+        accumulator.budget_limited = True
+        accumulator.skipped = not accumulator.rounds
+        if budget is not None and accumulator.skipped:
+            budget.mark_skipped()
 
 
 def _merge_memory(

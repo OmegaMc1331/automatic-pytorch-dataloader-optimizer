@@ -23,7 +23,7 @@ WORKLOADS = (
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run the six APDO v0.4.1 workloads and write JSON/HTML reports."
+        description="Run the six APDO v0.5.0 workloads and write JSON/HTML reports."
     )
     parser.add_argument(
         "--workload",
@@ -103,6 +103,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip independent validation (smoke tests only; gains cannot be confirmed)",
     )
     parser.add_argument(
+        "--search-strategy",
+        choices=("grid", "adaptive"),
+        default="grid",
+        help="search strategy (default: grid)",
+    )
+    parser.add_argument(
+        "--time-budget-s",
+        type=float,
+        default=None,
+        help="cooperative optimization budget per workload",
+    )
+    parser.add_argument(
+        "--planned-epochs",
+        type=int,
+        default=None,
+        help="future epoch horizon for profitability estimates",
+    )
+    parser.add_argument(
+        "--planned-sessions",
+        type=int,
+        default=1,
+        help="future session count for profitability estimates (default: 1)",
+    )
+    parser.add_argument(
+        "--cache-policy",
+        choices=("off", "hint", "revalidate"),
+        default="off",
+        help="recommendation cache policy (default: off)",
+    )
+    parser.add_argument(
+        "--cache-key",
+        default=None,
+        help="explicit recommendation cache key",
+    )
+    parser.add_argument(
+        "--recommendation-cache-directory",
+        type=Path,
+        default=None,
+        help="recommendation cache directory (default: user cache directory)",
+    )
+    parser.add_argument(
         "--cache-directory",
         type=Path,
         default=Path("benchmarks/.cache"),
@@ -153,6 +194,13 @@ def main() -> int:
             timing_profile=args.timing_profile,
             selection_metric=args.selection_metric,
             comparability_policy=args.comparability_policy,
+            search_strategy=args.search_strategy,
+            time_budget_s=args.time_budget_s,
+            planned_epochs=args.planned_epochs,
+            planned_sessions=args.planned_sessions,
+            cache_policy=args.cache_policy,
+            cache_key=args.cache_key,
+            cache_directory=args.recommendation_cache_directory,
             progress=lambda message: print(message, flush=True),
         )
         json_path = args.output_directory / f"{name}.json"
@@ -200,6 +248,15 @@ def main() -> int:
                     else None
                 ),
                 "duration_s": result.duration_s,
+                "search_strategy": result.settings.search_strategy,
+                "search_trace": (
+                    result.search_trace.to_dict() if result.search_trace is not None else None
+                ),
+                "budget": result.budget,
+                "profitability": (
+                    result.profitability.to_dict() if result.profitability is not None else None
+                ),
+                "cache": result.cache,
             }
         )
 

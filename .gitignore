@@ -16,6 +16,7 @@ benchmark.json
 benchmark.html
 benchmarks/.cache/
 benchmarks/results/
+benchmarks/results-*/
 reports/
 .idea/
 .vscode/

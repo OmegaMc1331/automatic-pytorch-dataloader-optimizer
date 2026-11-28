@@ -21,7 +21,12 @@ from apdo.optimizer import (
     resolve_device,
 )
 from tests.datasets import RaisingDataset, SyntheticDataset
-from tests.helpers import make_failed_measurement, make_measurement, make_pass_metrics
+from tests.helpers import (
+    make_failed_measurement,
+    make_measurement,
+    make_pass_metrics,
+    make_validation,
+)
 
 
 def test_build_worker_counts_is_bounded() -> None:
@@ -628,3 +633,84 @@ def test_optimize_rejects_invalid_timing_and_comparability_options() -> None:
         optimize(dataset, batch_size=4, comparability_policy="maybe")
     with pytest.raises(ConfigurationError, match="sample_fingerprint_fn"):
         optimize(dataset, batch_size=4, sample_fingerprint_fn=42)
+
+
+def test_optimize_adaptive_search_records_trace_and_budget() -> None:
+    result = optimize(
+        SyntheticDataset(size=32, feature_dim=4, delay_s=0.0002),
+        batch_size=8,
+        device="cpu",
+        warmup_runs=1,
+        repetitions=2,
+        validation=False,
+        max_batches=3,
+        max_workers=1,
+        seed=4,
+        search_strategy="adaptive",
+        planned_epochs=2,
+    )
+
+    assert result.search_trace is not None
+    assert result.search_trace.strategy == "adaptive"
+    assert result.search_trace.stages[0].name == "screening"
+    assert result.budget["status"] in {"unlimited", "available", "exhausted"}
+    assert result.profitability is not None
+    assert result.profitability.planned_epochs == 2
+    assert result.cache["policy"] == "off"
+    assert any("adaptive" in warning.lower() for warning in result.warnings)
+
+
+def test_optimize_stores_and_reuses_confirmed_cache(monkeypatch, tmp_path) -> None:
+    baseline = LoaderConfig()
+    candidate = LoaderConfig(num_workers=1, prefetch_factor=2)
+
+    def fake_stage(*args, **kwargs):
+        return StageResult(
+            measurements=(
+                make_measurement(baseline, (100.0, 100.0)),
+                make_measurement(candidate, (120.0, 120.0)),
+            ),
+            orders=(),
+        )
+
+    def fake_validation(**kwargs):
+        return (
+            make_validation(kwargs["baseline_config"], kwargs["candidate_config"]),
+            (),
+            False,
+        )
+
+    monkeypatch.setattr(optimizer_module, "_run_stage", fake_stage)
+    monkeypatch.setattr(optimizer_module, "_run_validation", fake_validation)
+    dataset = SyntheticDataset(size=32, feature_dim=4)
+
+    first = optimize(
+        dataset,
+        batch_size=8,
+        device="cpu",
+        repetitions=2,
+        validation_rounds=8,
+        max_batches=3,
+        max_workers=1,
+        cache_policy="hint",
+        cache_directory=tmp_path,
+        seed=4,
+    )
+    second = optimize(
+        dataset,
+        batch_size=8,
+        device="cpu",
+        repetitions=2,
+        validation_rounds=8,
+        max_batches=3,
+        max_workers=1,
+        cache_policy="hint",
+        cache_directory=tmp_path,
+        seed=4,
+    )
+
+    assert first.cache["stored"] is True
+    assert not first.cache["hit"]
+    assert second.cache["hit"]
+    assert second.cache["stored"] is True
+    assert any("cache" in warning.lower() for warning in second.warnings)
